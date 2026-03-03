@@ -6,9 +6,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram import Router
-
 import os
+
 BOT_TOKEN = os.getenv("8332844538:AAHMhU-XEn1Umk0fpfBefc3bvST0o5su9BU")
+
+if not BOT_TOKEN:
+    raise ValueError("8332844538:AAHMhU-XEn1Umk0fpfBefc3bvST0o5su9BU")
 
 logging.basicConfig(level=logging.INFO)
 
