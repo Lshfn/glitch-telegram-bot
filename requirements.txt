@@ -1,4 +1,9 @@
 aiogram==3.26.0
-opencv-python-headless>=4.8.0
-moviepy>=2.0.0
-numpy>=1.25.0
+opencv-python-headless==4.13.0.92
+moviepy==2.2.1
+numpy==2.4.2
+Pillow==11.3.0
+imageio==2.37.2
+imageio-ffmpeg==0.6.0
+python-dotenv==1.2.2
+tqdm==4.67.3
