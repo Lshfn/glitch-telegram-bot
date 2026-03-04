@@ -8,10 +8,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram import Router
 import os
 
-BOT_TOKEN = os.getenv("8332844538:AAHMhU-XEn1Umk0fpfBefc3bvST0o5su9BU")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    raise ValueError("8332844538:AAHMhU-XEn1Umk0fpfBefc3bvST0o5su9BU")
+    raise ValueError("BOT_TOKEN not set in environment variables")
 
 logging.basicConfig(level=logging.INFO)
 
