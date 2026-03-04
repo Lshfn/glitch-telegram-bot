@@ -1,3 +1,4 @@
 aiogram==3.26.0
-Pillow==9.5.0
-moviepy==2.0.0.dev9
+opencv-python-headless>=4.8.0
+moviepy>=2.0.0
+numpy>=1.25.0
