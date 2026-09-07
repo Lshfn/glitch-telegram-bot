@@ -3,248 +3,624 @@ import random
 import asyncio
 import math
 from io import BytesIO
-from PIL import Image
 
+from PIL import Image, ImageChops, ImageEnhance, ImageOps
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Each time the same Telegram file is sent again, the bot raises its glitch level.
 glitch_levels = {}
 
-# ----------------
-# BYTE CHAOS
-# ----------------
+# Keep the escalation expressive without allowing accidental gigantic loops.
+MAX_INTENSITY = 12
 
+
+# ---------------------------------------------------------------------------
+# GENERIC BYTE CHAOS (GIF / MP4 / unknown files)
+# ---------------------------------------------------------------------------
 def corrupt_bytes(data, intensity):
+    """Corrupt payload bytes using a random mixture of mutation styles.
 
-    data = bytearray(data)
+    We avoid the beginning/end of the file so headers and trailers have a better
+    chance of surviving. This is still intentionally destructive for formats we
+    do not decode ourselves.
+    """
+    if len(data) < 64:
+        return data
 
-    changes = int(len(data) * 0.003 * intensity)
+    level = min(max(intensity, 1), MAX_INTENSITY)
+    buf = bytearray(data)
 
-    for _ in range(changes):
-        i = random.randint(0, len(data) - 1)
-        data[i] = random.randint(0, 255)
+    start = max(16, int(len(buf) * random.uniform(0.06, 0.18)))
+    end = min(len(buf) - 8, int(len(buf) * random.uniform(0.82, 0.96)))
+    if end <= start:
+        return bytes(buf)
 
-    return bytes(data)
+    bursts = random.randint(2, 4 + level * 2)
+
+    for _ in range(bursts):
+        mode = random.choice(("noise", "xor", "repeat", "zero", "swap"))
+        pos = random.randint(start, end - 1)
+        max_span = max(1, min(end - pos, 4 + level * 12))
+        span = random.randint(1, max_span)
+
+        if mode == "noise":
+            for i in range(pos, pos + span):
+                buf[i] = random.randrange(256)
+
+        elif mode == "xor":
+            mask = random.randrange(1, 256)
+            for i in range(pos, pos + span):
+                buf[i] ^= mask
+
+        elif mode == "repeat":
+            source = random.randint(start, max(start, end - span))
+            buf[pos:pos + span] = buf[source:source + span]
+
+        elif mode == "zero":
+            value = random.choice((0x00, 0xFF, random.randrange(256)))
+            buf[pos:pos + span] = bytes([value]) * span
+
+        elif mode == "swap" and span > 1:
+            other = random.randint(start, max(start, end - span))
+            a = bytes(buf[pos:pos + span])
+            b = bytes(buf[other:other + span])
+            buf[pos:pos + span] = b
+            buf[other:other + span] = a
+
+    return bytes(buf)
 
 
-# ----------------
-# RGB SHIFT
-# ----------------
+# ---------------------------------------------------------------------------
+# IMAGE GLITCH EFFECTS
+# ---------------------------------------------------------------------------
+def _shift_channel(channel, dx=0, dy=0):
+    return ImageChops.offset(channel, dx, dy)
 
-def rgb_shift(img):
 
+def rgb_shift(img, strength):
+    """Independent horizontal/vertical displacement of RGB channels."""
     r, g, b = img.split()
+    max_x = max(2, int(img.width * (0.003 + 0.018 * strength)))
+    max_y = max(1, int(img.height * (0.001 + 0.008 * strength)))
 
-    r = r.transform(r.size, Image.AFFINE, (1, 0, random.randint(-5, 5), 0, 1, 0))
-    b = b.transform(b.size, Image.AFFINE, (1, 0, random.randint(5, 10), 0, 1, 0))
+    shifts = []
+    for channel in (r, g, b):
+        dx = random.randint(-max_x, max_x)
+        dy = random.randint(-max_y, max_y) if random.random() < 0.45 else 0
+        shifts.append(_shift_channel(channel, dx, dy))
 
-    return Image.merge("RGB", (r, g, b))
+    if random.random() < 0.22 + strength * 0.35:
+        random.shuffle(shifts)
 
-
-# ----------------
-# PIXEL SORT
-# ----------------
-
-def pixel_sort(img):
-
-    pixels = list(img.getdata())
-
-    step = random.randint(200, 800)
-
-    for i in range(0, len(pixels), step):
-
-        block = pixels[i:i + step]
-        block.sort(key=lambda x: sum(x))
-
-        pixels[i:i + step] = block
-
-    img.putdata(pixels)
-
-    return img
+    return Image.merge("RGB", tuple(shifts))
 
 
-# ----------------
-# VHS LINES
-# ----------------
+def band_shift(img, strength):
+    """Move irregular horizontal strips independently."""
+    out = img.copy()
+    count = random.randint(2, 4 + int(strength * 18))
+    max_shift = max(4, int(img.width * (0.02 + strength * 0.24)))
 
-def vhs_lines(img):
-
-    pixels = img.load()
-
-    for y in range(0, img.height, random.randint(4, 12)):
-
-        shift = random.randint(-30, 30)
-
-        for x in range(img.width):
-
-            nx = (x + shift) % img.width
-            pixels[x, y] = pixels[nx, y]
-
-    return img
-
-
-# ----------------
-# CRT DISTORTION
-# ----------------
-
-def crt_distortion(img):
-
-    pixels = img.load()
-
-    for y in range(img.height):
-
-        wave = int(10 * random.random() * math.sin(y / 20))
-
-        for x in range(img.width):
-
-            nx = (x + wave) % img.width
-            pixels[x, y] = pixels[nx, y]
-
-    return img
-
-
-# ----------------
-# FRACTAL CHAOS
-# ----------------
-
-def fractal_noise(img, intensity):
-
-    pixels = img.load()
-
-    amount = 1000 * intensity
-
-    for _ in range(amount):
-
-        x = random.randint(0, img.width - 1)
-        y = random.randint(0, img.height - 1)
-
-        pixels[x, y] = (
-            random.randint(0, 255),
-            random.randint(0, 255),
-            random.randint(0, 255)
+    for _ in range(count):
+        h = random.randint(
+            max(1, img.height // 120),
+            max(2, img.height // max(8, int(45 - strength * 30))),
         )
+        y = random.randint(0, max(0, img.height - h))
+        strip = out.crop((0, y, img.width, y + h))
 
-    return img
+        dx = random.randint(-max_shift, max_shift)
+        strip = ImageChops.offset(strip, dx, 0)
+
+        if random.random() < 0.2:
+            strip = ImageOps.mirror(strip)
+        if random.random() < 0.12:
+            strip = ImageOps.invert(strip)
+
+        out.paste(strip, (0, y))
+
+    return out
 
 
-# ----------------
-# IMAGE GLITCH
-# ----------------
+def block_displace(img, strength):
+    """Duplicate, displace, mirror and occasionally invert rectangular regions."""
+    out = img.copy()
+    count = random.randint(2, 3 + int(strength * 14))
 
-def glitch_image(data, intensity):
+    for _ in range(count):
+        bw = random.randint(max(4, img.width // 30), max(5, img.width // 3))
+        bh = random.randint(max(3, img.height // 40), max(4, img.height // 3))
+        x = random.randint(0, max(0, img.width - bw))
+        y = random.randint(0, max(0, img.height - bh))
+        block = out.crop((x, y, x + bw, y + bh))
 
-    img = Image.open(BytesIO(data)).convert("RGB")
+        if random.random() < 0.25:
+            block = ImageOps.mirror(block)
+        if random.random() < 0.12 + strength * 0.2:
+            block = ImageOps.flip(block)
+        if random.random() < 0.08 + strength * 0.15:
+            block = ImageOps.invert(block)
 
-    img = rgb_shift(img)
-    img = pixel_sort(img)
-    img = vhs_lines(img)
-    img = crt_distortion(img)
-    img = fractal_noise(img, intensity)
+        max_dx = max(3, int(img.width * (0.03 + 0.22 * strength)))
+        max_dy = max(2, int(img.height * (0.02 + 0.12 * strength)))
+        nx = max(0, min(img.width - bw, x + random.randint(-max_dx, max_dx)))
+        ny = max(0, min(img.height - bh, y + random.randint(-max_dy, max_dy)))
+        out.paste(block, (nx, ny))
+
+    return out
+
+
+def channel_blocks(img, strength):
+    """Swap/offset channels only inside selected blocks."""
+    out = img.copy()
+    count = random.randint(1, 2 + int(strength * 9))
+
+    for _ in range(count):
+        bw = random.randint(max(8, img.width // 16), max(9, img.width // 2))
+        bh = random.randint(max(6, img.height // 24), max(7, img.height // 3))
+        x = random.randint(0, max(0, img.width - bw))
+        y = random.randint(0, max(0, img.height - bh))
+        block = out.crop((x, y, x + bw, y + bh))
+        r, g, b = block.split()
+        channels = [r, g, b]
+        random.shuffle(channels)
+
+        max_shift = max(1, int(bw * (0.02 + strength * 0.12)))
+        channel_index = random.randrange(3)
+        channels[channel_index] = ImageChops.offset(
+            channels[channel_index], random.randint(-max_shift, max_shift), 0
+        )
+        block = Image.merge("RGB", tuple(channels))
+        out.paste(block, (x, y))
+
+    return out
+
+
+def wave_warp(img, strength):
+    """Horizontal sinusoidal displacement with variable frequency and phase."""
+    out = Image.new("RGB", img.size)
+    strip_h = random.randint(1, max(2, int(3 + 8 * (1 - strength))))
+    amplitude = max(2, int(img.width * random.uniform(0.01, 0.04 + 0.08 * strength)))
+    wavelength = random.uniform(12, 90 - min(60, strength * 45))
+    phase = random.uniform(0, math.tau)
+
+    for y in range(0, img.height, strip_h):
+        h = min(strip_h, img.height - y)
+        strip = img.crop((0, y, img.width, y + h))
+        local_amp = amplitude * random.uniform(0.65, 1.35)
+        dx = int(local_amp * math.sin((y / wavelength) + phase))
+        if random.random() < 0.04 + strength * 0.12:
+            dx += random.randint(-amplitude, amplitude)
+        out.paste(ImageChops.offset(strip, dx, 0), (0, y))
+
+    return out
+
+
+def scanline_dropout(img, strength):
+    """Create analog-looking scanline dropouts, streaks and small slices."""
+    out = img.copy()
+    count = random.randint(3, 8 + int(strength * 25))
+
+    for _ in range(count):
+        y = random.randrange(img.height)
+        h = random.randint(1, max(1, int(1 + strength * 8)))
+        h = min(h, img.height - y)
+        if h <= 0:
+            continue
+
+        line = out.crop((0, y, img.width, y + h))
+        mode = random.choice(("dark", "bright", "invert", "offset", "mono"))
+
+        if mode == "dark":
+            line = ImageEnhance.Brightness(line).enhance(random.uniform(0.05, 0.55))
+        elif mode == "bright":
+            line = ImageEnhance.Brightness(line).enhance(random.uniform(1.4, 2.6))
+        elif mode == "invert":
+            line = ImageOps.invert(line)
+        elif mode == "offset":
+            line = ImageChops.offset(
+                line, random.randint(-max(2, img.width // 5), max(2, img.width // 5)), 0
+            )
+        elif mode == "mono":
+            gray = ImageOps.grayscale(line)
+            line = Image.merge("RGB", (gray, gray, gray))
+
+        out.paste(line, (0, y))
+
+    return out
+
+
+def pixel_sort_bands(img, strength):
+    """Sort selected row segments instead of sorting the entire image uniformly."""
+    out = img.copy()
+    px = out.load()
+    rows = random.randint(3, 8 + int(strength * 24))
+
+    for _ in range(rows):
+        y = random.randrange(img.height)
+        x1 = random.randrange(max(1, img.width - 1))
+        min_len = max(8, img.width // 20)
+        max_len = max(min_len, int(img.width * random.uniform(0.15, 0.75)))
+        x2 = min(img.width, x1 + random.randint(min_len, max_len))
+        if x2 - x1 < 2:
+            continue
+
+        segment = [px[x, y] for x in range(x1, x2)]
+        key = random.choice((
+            lambda c: sum(c),
+            lambda c: c[0],
+            lambda c: c[1],
+            lambda c: c[2],
+            lambda c: max(c) - min(c),
+        ))
+        segment.sort(key=key, reverse=random.random() < 0.5)
+
+        # Sometimes rotate the sorted segment so the effect is less "textbook".
+        if random.random() < 0.45 and segment:
+            cut = random.randrange(len(segment))
+            segment = segment[cut:] + segment[:cut]
+
+        for i, color in enumerate(segment):
+            px[x1 + i, y] = color
+
+        # Smear the row into a small vertical band.
+        if random.random() < 0.55:
+            band_h = random.randint(1, max(1, int(1 + strength * 7)))
+            source = out.crop((x1, y, x2, y + 1))
+            for yy in range(y + 1, min(img.height, y + band_h)):
+                out.paste(source, (x1, yy))
+
+    return out
+
+
+def noise_blocks(img, strength):
+    """Add clustered digital noise instead of evenly distributed single pixels."""
+    out = img.copy()
+    px = out.load()
+    clusters = random.randint(2, 5 + int(strength * 16))
+
+    for _ in range(clusters):
+        cx = random.randrange(img.width)
+        cy = random.randrange(img.height)
+        radius_x = random.randint(2, max(3, int(img.width * (0.005 + 0.035 * strength))))
+        radius_y = random.randint(1, max(2, int(img.height * (0.004 + 0.025 * strength))))
+        mode = random.choice(("noise", "xor", "white", "black"))
+
+        for y in range(max(0, cy - radius_y), min(img.height, cy + radius_y + 1)):
+            for x in range(max(0, cx - radius_x), min(img.width, cx + radius_x + 1)):
+                if random.random() > random.uniform(0.25, 0.82):
+                    continue
+                r, g, b = px[x, y]
+                if mode == "noise":
+                    px[x, y] = (random.randrange(256), random.randrange(256), random.randrange(256))
+                elif mode == "xor":
+                    mask = random.randrange(32, 256)
+                    px[x, y] = (r ^ mask, g ^ mask, b ^ mask)
+                elif mode == "white":
+                    v = random.randrange(180, 256)
+                    px[x, y] = (v, v, v)
+                else:
+                    v = random.randrange(0, 65)
+                    px[x, y] = (v, v, v)
+
+    return out
+
+
+def feedback_echo(img, strength):
+    """Blend several offset copies to create recursive/feedback-like echoes."""
+    out = img.copy()
+    echoes = random.randint(1, 2 + int(strength * 5))
+    max_dx = max(2, int(img.width * (0.015 + strength * 0.08)))
+    max_dy = max(1, int(img.height * (0.01 + strength * 0.05)))
+
+    for _ in range(echoes):
+        shifted = ImageChops.offset(
+            out,
+            random.randint(-max_dx, max_dx),
+            random.randint(-max_dy, max_dy),
+        )
+        alpha = random.uniform(0.12, 0.38)
+        out = Image.blend(out, shifted, alpha)
+
+    return out
+
+
+def compression_ghost(img, strength):
+    """Introduce JPEG blocks/ghosting while keeping the final image valid."""
+    quality_min = max(8, int(42 - strength * 28))
+    quality_max = max(quality_min + 1, int(72 - strength * 24))
+    quality = random.randint(quality_min, quality_max)
 
     buf = BytesIO()
-    img.save(buf, "PNG")
+    img.save(buf, "JPEG", quality=quality, optimize=False)
+    buf.seek(0)
+    compressed = Image.open(buf).convert("RGB")
 
-    return buf.getvalue()
+    if random.random() < 0.55:
+        dx = random.randint(-max(1, img.width // 60), max(1, img.width // 60))
+        compressed = ImageChops.offset(compressed, dx, 0)
+        compressed = Image.blend(img, compressed, random.uniform(0.35, 0.8))
 
-
-# ----------------
-# JPEG GLITCH
-# ----------------
-
-def jpeg_glitch(data, intensity):
-
-    data = bytearray(data)
-
-    start = int(len(data) * 0.1)
-    end = int(len(data) * 0.8)
-
-    for _ in range(200 * intensity):
-
-        i = random.randint(start, end)
-        data[i] = random.randint(0, 255)
-
-    return bytes(data)
+    return compressed
 
 
-# ----------------
+def palette_crush(img, strength):
+    """Occasional posterization / contrast break-up."""
+    bits = random.choice((2, 3, 4, 5))
+    crushed = ImageOps.posterize(img, bits)
+    if random.random() < 0.45:
+        crushed = ImageEnhance.Contrast(crushed).enhance(random.uniform(1.2, 2.3))
+    return Image.blend(img, crushed, random.uniform(0.25, 0.72))
+
+
+EFFECTS = {
+    "rgb split": rgb_shift,
+    "band drift": band_shift,
+    "block displacement": block_displace,
+    "channel blocks": channel_blocks,
+    "wave warp": wave_warp,
+    "scanline dropout": scanline_dropout,
+    "pixel sort": pixel_sort_bands,
+    "noise clusters": noise_blocks,
+    "feedback echo": feedback_echo,
+    "compression ghosts": compression_ghost,
+    "palette crush": palette_crush,
+}
+
+
+# Weights make some effects common and others feel like rarer surprises.
+EFFECT_WEIGHTS = {
+    "rgb split": 1.25,
+    "band drift": 1.55,
+    "block displacement": 1.35,
+    "channel blocks": 0.85,
+    "wave warp": 0.9,
+    "scanline dropout": 1.2,
+    "pixel sort": 1.0,
+    "noise clusters": 0.8,
+    "feedback echo": 0.65,
+    "compression ghosts": 0.75,
+    "palette crush": 0.45,
+}
+
+
+def _weighted_unique_effects(count):
+    names = list(EFFECTS)
+    picked = []
+
+    while names and len(picked) < count:
+        weights = [EFFECT_WEIGHTS[name] for name in names]
+        choice = random.choices(names, weights=weights, k=1)[0]
+        picked.append(choice)
+        names.remove(choice)
+
+    return picked
+
+
+def make_glitch_recipe(intensity):
+    """Build a different recipe for every render."""
+    level = min(max(intensity, 1), MAX_INTENSITY)
+    strength = min(1.0, 0.10 + level * 0.075 + random.uniform(-0.04, 0.08))
+
+    # Level 1 is already visibly glitched; higher levels become denser rather
+    # than simply multiplying the same operation over and over.
+    minimum = 2 if level <= 2 else 3
+    maximum = min(len(EFFECTS), 3 + level // 2)
+    count = random.randint(minimum, max(minimum, maximum))
+
+    recipe = _weighted_unique_effects(count)
+    random.shuffle(recipe)
+
+    # At high intensity, occasionally repeat one effect at a different strength.
+    if level >= 5 and random.random() < 0.35:
+        recipe.insert(random.randrange(len(recipe) + 1), random.choice(recipe))
+
+    return recipe, strength
+
+
+def jpeg_databend(data, strength):
+    """Bend JPEG scan data, but keep the original if Pillow can no longer decode it.
+
+    This preserves the chaotic JPEG-artifact character of the old bot without
+    blindly returning an unreadable file every time.
+    """
+    buf = bytearray(data)
+    sos = buf.find(b"\xff\xda")
+    eoi = buf.rfind(b"\xff\xd9")
+
+    if sos < 0 or eoi < 0 or sos + 4 >= eoi:
+        return data
+
+    segment_length = int.from_bytes(buf[sos + 2:sos + 4], "big")
+    start = sos + 2 + segment_length
+    end = eoi
+    if start >= end - 4:
+        return data
+
+    original = bytes(buf)
+    bursts = random.randint(1, 2 + int(strength * 12))
+
+    for _ in range(bursts):
+        pos = random.randint(start, end - 2)
+        span = random.randint(1, max(1, int(2 + strength * 10)))
+        mask = random.randrange(1, 255)
+
+        for i in range(pos, min(end, pos + span)):
+            # Avoid touching marker/stuffing bytes.
+            if buf[i] == 0xFF or (i > 0 and buf[i - 1] == 0xFF):
+                continue
+            value = buf[i] ^ mask
+            if value == 0xFF:
+                value = 0xFE
+            buf[i] = value
+
+    bent = bytes(buf)
+    try:
+        test = Image.open(BytesIO(bent))
+        test.load()
+        return bent
+    except Exception:
+        return original
+
+
+def glitch_image(data, intensity, output_format="PNG"):
+    img = ImageOps.exif_transpose(Image.open(BytesIO(data))).convert("RGB")
+    recipe, strength = make_glitch_recipe(intensity)
+
+    for name in recipe:
+        # Each stage receives slightly different strength so two runs with the
+        # same intensity do not collapse into the same visual grammar.
+        stage_strength = min(1.0, max(0.05, strength * random.uniform(0.65, 1.35)))
+        img = EFFECTS[name](img, stage_strength)
+
+    buf = BytesIO()
+    if output_format.upper() == "JPEG":
+        img.save(buf, "JPEG", quality=random.randint(72, 94), subsampling=random.choice((0, 1, 2)))
+        result = buf.getvalue()
+        if random.random() < 0.20 + strength * 0.40:
+            bent = jpeg_databend(result, strength)
+            if bent != result:
+                result = bent
+                recipe.append("jpeg databend")
+        return result, recipe
+
+    img.save(buf, "PNG", optimize=False)
+    return buf.getvalue(), recipe
+
+
+# ---------------------------------------------------------------------------
 # ROUTER
-# ----------------
-
+# ---------------------------------------------------------------------------
 def glitch_router(data, name, intensity):
+    name = (name or "file.bin").lower()
 
-    name = name.lower()
-
-    if name.endswith(".jpg") or name.endswith(".jpeg"):
-        return jpeg_glitch(data, intensity)
+    if name.endswith((".jpg", ".jpeg")):
+        return glitch_image(data, intensity, "JPEG")
 
     if name.endswith(".png"):
-        return glitch_image(data, intensity)
+        return glitch_image(data, intensity, "PNG")
 
-    if name.endswith(".gif") or name.endswith(".mp4"):
-        return corrupt_bytes(data, intensity)
+    if name.endswith((".gif", ".mp4")):
+        return corrupt_bytes(data, intensity), ["byte chaos"]
 
-    return corrupt_bytes(data, intensity)
+    return corrupt_bytes(data, intensity), ["byte chaos"]
 
 
-# ----------------
+# ---------------------------------------------------------------------------
 # TELEGRAM HANDLER
-# ----------------
-
+# ---------------------------------------------------------------------------
 @dp.message()
 async def handle_file(message: types.Message):
-
     file_id = None
     filename = "file.bin"
 
     if message.photo:
         file_id = message.photo[-1].file_id
         filename = "image.jpg"
-
     elif message.video:
         file_id = message.video.file_id
         filename = "video.mp4"
-
     elif message.document:
         file_id = message.document.file_id
-        filename = message.document.file_name
+        filename = message.document.file_name or "file.bin"
 
     if not file_id:
         await message.answer("Send image / video / file")
         return
 
     file = await bot.get_file(file_id)
-
     file_data = await bot.download_file(file.file_path)
     data = file_data.read()
 
     level = glitch_levels.get(file_id, 1)
-    glitch_levels[file_id] = level + 1
+    glitch_levels[file_id] = min(level + 1, MAX_INTENSITY)
 
-    result = glitch_router(data, filename, level)
+    try:
+        result, recipe = glitch_router(data, filename, level)
+    except Exception as exc:
+        print(f"Glitch failed for {filename}: {exc}")
+        await message.answer("The glitch collapsed too hard. Try sending the file again.")
+        return
 
     telegram_file = BufferedInputFile(
         result,
-        filename="glitched_" + filename
+        filename="glitched_" + filename,
     )
 
+    # Keeping the reply itself minimal, but the server log now records the
+    # generated recipe so you can tune the aesthetic later.
+    print(f"level={level} file={filename} recipe={recipe}")
     await message.reply_document(telegram_file)
 
 
-# ----------------
+# ---------------------------------------------------------------------------
 # START
-# ----------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# START / DEPLOYMENT
+# ---------------------------------------------------------------------------
+WEBHOOK_PATH = "/telegram-webhook"
 
-async def main():
 
-    print("GLITCH BOT STARTED")
+async def healthcheck(request):
+    """Simple endpoint required by Render web services."""
+    return web.Response(text="glitch bot alive")
 
+
+async def on_render_startup(bot: Bot):
+    """Register Telegram webhook when running as a Render web service."""
+    base_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base_url:
+        raise RuntimeError("RENDER_EXTERNAL_URL is missing on Render")
+
+    webhook_url = f"{base_url}{WEBHOOK_PATH}"
+    await bot.set_webhook(
+        webhook_url,
+        allowed_updates=dp.resolve_used_update_types(),
+        drop_pending_updates=False,
+    )
+    print(f"GLITCH BOT WEBHOOK ACTIVE: {webhook_url}")
+
+
+async def run_local_polling():
+    """Convenient local mode: `python glitch_bot.py` still works off Render."""
+    # Telegram cannot use getUpdates while a webhook is configured.
+    await bot.delete_webhook(drop_pending_updates=False)
+    print("GLITCH BOT STARTED IN LOCAL POLLING MODE")
     await dp.start_polling(bot)
 
 
+def run_render_webhook():
+    """Run aiohttp + aiogram webhook on Render's required public port."""
+    dp.startup.register(on_render_startup)
+
+    app = web.Application()
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        handle_in_background=True,
+    ).register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    port = int(os.getenv("PORT", "10000"))
+    print(f"STARTING RENDER WEB SERVER ON 0.0.0.0:{port}")
+    web.run_app(app, host="0.0.0.0", port=port)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if os.getenv("RENDER") == "true" or os.getenv("RENDER_EXTERNAL_URL"):
+        run_render_webhook()
+    else:
+        asyncio.run(run_local_polling())

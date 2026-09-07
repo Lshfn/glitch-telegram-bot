@@ -1,10 +1,14 @@
-# render.yaml
 services:
   - type: web
     name: glitch-telegram-bot
-    env: python
-    python_version: "3.13.10"   # Ensures compatible version for Pillow & MoviePy
-    build_command: pip install --upgrade pip && pip install -r requirements.txt
-    start_command: python glitch_polling_bot_env.py
-    auto_deploy: true
-    plan: free   # Use free plan
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python glitch_bot.py
+    autoDeployTrigger: commit
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.10"
+      - key: BOT_TOKEN
+        sync: false
