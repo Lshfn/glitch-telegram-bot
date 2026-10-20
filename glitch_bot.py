@@ -2,6 +2,8 @@ import os
 import random
 import asyncio
 import math
+import logging
+import weakref
 from io import BytesIO
 
 from PIL import Image, ImageChops, ImageEnhance, ImageOps
@@ -9,14 +11,33 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
+import aiohttp
+
+from artifact_memory import ArtifactMemory, extract_artifact, open_image
+from language_glitch import Translator, TEXT_EXTENSIONS, decode_text, read_regions
+from memory_effects import inherit_image, inherit_bytes, glitch_text
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 
-# Each time the same Telegram file is sent again, the bot raises its glitch level.
-glitch_levels = {}
+# Repeated file content escalates within the sender's history, across restarts.
+memory = ArtifactMemory(os.getenv("MEMORY_DB", "data/artifacts.sqlite3"))
+translator = Translator(os.getenv("TRANSLATE_URL", ""), os.getenv("TRANSLATE_API_KEY", ""),
+                        [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()])
+processing_slots = asyncio.Semaphore(2)
+chat_locks = weakref.WeakValueDictionary()
+logger = logging.getLogger(__name__)
+MAX_UPLOAD = 10 * 1024 * 1024
+
+
+def chat_lock(chat):
+    lock = chat_locks.get(chat)
+    if lock is None:
+        lock = asyncio.Lock()
+        chat_locks[chat] = lock
+    return lock
 
 # Keep the escalation expressive without allowing accidental gigantic loops.
 MAX_INTENSITY = 12
@@ -471,15 +492,26 @@ def jpeg_databend(data, strength):
         return original
 
 
-def glitch_image(data, intensity, output_format="PNG"):
-    img = ImageOps.exif_transpose(Image.open(BytesIO(data))).convert("RGB")
+def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=None):
+    img = prepared.copy() if prepared is not None else open_image(data)
     recipe, strength = make_glitch_recipe(intensity)
+
+    # Inheritance can enter before or after the current upload's own effects.
+    memory_first = random.random() < .5
+    if memory_first:
+        img, inherited = inherit_image(img, artifacts, strength)
+    else:
+        inherited = []
 
     for name in recipe:
         # Each stage receives slightly different strength so two runs with the
         # same intensity do not collapse into the same visual grammar.
         stage_strength = min(1.0, max(0.05, strength * random.uniform(0.65, 1.35)))
         img = EFFECTS[name](img, stage_strength)
+
+    if not memory_first:
+        img, inherited = inherit_image(img, artifacts, strength)
+    recipe.extend(inherited)
 
     buf = BytesIO()
     if output_format.upper() == "JPEG":
@@ -499,19 +531,62 @@ def glitch_image(data, intensity, output_format="PNG"):
 # ---------------------------------------------------------------------------
 # ROUTER
 # ---------------------------------------------------------------------------
-def glitch_router(data, name, intensity):
+def glitch_router(data, name, intensity, artifacts=()):
     name = (name or "file.bin").lower()
 
     if name.endswith((".jpg", ".jpeg")):
-        return glitch_image(data, intensity, "JPEG")
+        return glitch_image(data, intensity, "JPEG", artifacts)
 
     if name.endswith(".png"):
-        return glitch_image(data, intensity, "PNG")
+        return glitch_image(data, intensity, "PNG", artifacts)
 
-    if name.endswith((".gif", ".mp4")):
-        return corrupt_bytes(data, intensity), ["byte chaos"]
+    data, inherited = inherit_bytes(data, artifacts, intensity)
+    return corrupt_bytes(data, intensity), inherited + ["byte chaos"]
 
-    return corrupt_bytes(data, intensity), ["byte chaos"]
+
+async def process_upload(data, filename, level, artifacts, translate=False):
+    name = filename.lower()
+    notices, translated, failures = [], [], 0
+    artifact_text = ""
+    is_image = name.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"))
+    if is_image:
+        image = await asyncio.to_thread(open_image, data)
+        if translate and translator.configured:
+            try:
+                regions = await asyncio.to_thread(read_regions, image)
+                artifact_text = " ".join(r.text for r in regions)
+                async with aiohttp.ClientSession() as session:
+                    async with asyncio.timeout(24):
+                        image, translated, failures = await translator.replace_regions(image, regions, session)
+                if not regions:
+                    notices.append("No readable text detected in this image.")
+            except (RuntimeError, ImportError, asyncio.TimeoutError) as exc:
+                notices.append("Image translation unavailable (OCR setup or time limit).")
+                logger.warning("OCR/translation skipped: %s", type(exc).__name__)
+        output_format = "JPEG" if name.endswith((".jpg", ".jpeg")) else "PNG"
+        result, recipe = await asyncio.to_thread(glitch_image, data, level, output_format, artifacts, image)
+        if output_format == "PNG" and not name.endswith(".png"):
+            filename = os.path.splitext(filename)[0] + ".png"
+    elif name.endswith(TEXT_EXTENSIONS):
+        text, _encoding = decode_text(data)
+        if translate and translator.configured:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with asyncio.timeout(24):
+                        text, translated, failures = await translator.replace_spans(text, session)
+            except asyncio.TimeoutError:
+                notices.append("Translation time limit reached; text glitches still applied.")
+        text, recipe = await asyncio.to_thread(glitch_text, text, artifacts, level)
+        artifact_text = text
+        result = text.encode("utf-8")
+    else:
+        result, recipe = await asyncio.to_thread(glitch_router, data, filename, level, artifacts)
+    if translated:
+        recipe.append("translations: " + ", ".join(translated))
+    if failures:
+        notices.append("Some translations failed; remaining glitches still applied.")
+    artifact = await asyncio.to_thread(extract_artifact, result, artifact_text, is_image)
+    return result, recipe, artifact, notices, filename
 
 
 # ---------------------------------------------------------------------------
@@ -519,46 +594,90 @@ def glitch_router(data, name, intensity):
 # ---------------------------------------------------------------------------
 @dp.message()
 async def handle_file(message: types.Message):
-    file_id = None
-    filename = "file.bin"
+    # A private history per sender AND chat, including in group conversations.
+    scope = f"{message.chat.id}:{message.from_user.id if message.from_user else 0}"
+    command = (message.text or "").split()
+    action = command[0].split("@")[0].lower() if command else ""
+    async with chat_lock(scope):
+        if action in ("/start", "/help"):
+            await message.answer(
+                "Send an image, video or file. Later uploads inherit fragments of your earlier ones "
+                "in this chat (up to 24 recent files, seven days). Text files stay readable UTF-8.\n"
+                "/forget — erase your stored fragments and reset intensity\n"
+                "/translate on — enable random translations via the configured service\n"
+                "/translate off — disable translations\n"
+                "/status — show memory, translation and OCR availability"
+            )
+            return
+        if action == "/forget":
+            await asyncio.to_thread(memory.forget, scope)
+            await message.answer("Your stored fragments and intensity history here are erased. Translation is off.")
+            return
+        if action == "/translate":
+            option = command[1].lower() if len(command) > 1 else ""
+            if option not in ("on", "off"):
+                await message.answer("Use /translate on or /translate off. Only selected text/OCR snippets go to the configured translation service.")
+                return
+            if option == "on" and not translator.configured:
+                await message.answer("Translation needs TRANSLATE_URL configured by the bot owner. Image translation also needs local Tesseract (see README).")
+                return
+            await asyncio.to_thread(memory.translations, scope, option == "on")
+            await message.answer(
+                "Translation on: selected text snippets and locally recognized image text will be sent to "
+                + translator.url + ". Use /translate off to stop."
+                if option == "on" else "Translation off."
+            )
+            return
+        if action == "/status":
+            import shutil
+            _, history = await asyncio.to_thread(memory.snapshot, scope, "")
+            enabled = await asyncio.to_thread(memory.translations, scope)
+            await message.answer(
+                f"Stored traces: {len(history)}/24 (your uploads in this chat only).\n"
+                f"Translation service: {'configured' if translator.configured else 'not configured'}; "
+                f"your mode: {'on' if enabled else 'off'}.\n"
+                f"OCR executable: {'available' if shutil.which('tesseract') else 'missing; use Docker setup'}."
+            )
+            return
 
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        filename = "image.jpg"
-    elif message.video:
-        file_id = message.video.file_id
-        filename = "video.mp4"
-    elif message.document:
-        file_id = message.document.file_id
-        filename = message.document.file_name or "file.bin"
-
-    if not file_id:
-        await message.answer("Send image / video / file")
-        return
-
-    file = await bot.get_file(file_id)
-    file_data = await bot.download_file(file.file_path)
-    data = file_data.read()
-
-    level = glitch_levels.get(file_id, 1)
-    glitch_levels[file_id] = min(level + 1, MAX_INTENSITY)
-
-    try:
-        result, recipe = glitch_router(data, filename, level)
-    except Exception as exc:
-        print(f"Glitch failed for {filename}: {exc}")
-        await message.answer("The glitch collapsed too hard. Try sending the file again.")
-        return
-
-    telegram_file = BufferedInputFile(
-        result,
-        filename="glitched_" + filename,
-    )
-
-    # Keeping the reply itself minimal, but the server log now records the
-    # generated recipe so you can tune the aesthetic later.
-    print(f"level={level} file={filename} recipe={recipe}")
-    await message.reply_document(telegram_file)
+        upload = message.photo[-1] if message.photo else message.video or message.document
+        if not upload:
+            await message.answer("Send an image / video / file, or /help.")
+            return
+        if upload.file_size and upload.file_size > MAX_UPLOAD:
+            await message.answer("Please send a file smaller than 10 MB.")
+            return
+        filename = ("image.jpg" if message.photo else
+                    (message.document.file_name or "file.bin") if message.document else "video.mp4")
+        # Strip client-supplied directory components from the reply filename.
+        filename = filename.replace("\\", "/").rsplit("/", 1)[-1][:180] or "file.bin"
+        async with processing_slots:
+            try:
+                file = await bot.get_file(upload.file_id)
+                stream = await bot.download_file(file.file_path)
+                data = stream.read(MAX_UPLOAD + 1)
+                if len(data) > MAX_UPLOAD:
+                    await message.answer("Please send a file smaller than 10 MB.")
+                    return
+                if filename.lower().endswith(TEXT_EXTENSIONS) and len(data) > 512 * 1024:
+                    await message.answer("Text files must be smaller than 512 KB.")
+                    return
+                digest = memory.digest(data)
+                level, history = await asyncio.to_thread(memory.snapshot, scope, digest)
+                enabled = await asyncio.to_thread(memory.translations, scope)
+                result, recipe, artifact, notices, filename = await process_upload(
+                    data, filename, level, history, enabled)
+                await message.reply_document(
+                    BufferedInputFile(result, filename="glitched_" + filename),
+                    caption="\n".join(notices)[:900] or None,
+                )
+                # Failed processing/delivery never becomes a donor for later files.
+                await asyncio.to_thread(memory.remember, scope, digest, level, artifact)
+                logger.info("Glitch level=%s effects=%s", level, recipe)
+            except Exception as exc:
+                # Do not log uploaded names, OCR text, file bytes or provider keys.
+                logger.warning("Glitch failed: %s", type(exc).__name__)
+                await message.answer("The glitch collapsed too hard. Try a smaller file or send it again.")
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +739,9 @@ def run_render_webhook():
 
 
 if __name__ == "__main__":
+    if bot is None:
+        raise RuntimeError("BOT_TOKEN is required to run the Telegram bot")
+    logging.basicConfig(level=logging.INFO)
     if os.getenv("RENDER") == "true" or os.getenv("RENDER_EXTERNAL_URL"):
         run_render_webhook()
     else:
