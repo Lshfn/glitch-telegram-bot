@@ -1,5 +1,13 @@
 # Glitch Telegram bot
 
+A poetic glitch interpretation of what is happening to Telegram in Russia.
+The bot turns interruptions in communication into changes in the files themselves:
+images break apart, fragments of earlier uploads return, and words slip into other languages.
+
+![A glitched image produced by the bot](<glitched_image%20(31).jpg>)
+
+## How it works
+
 The bot makes images inherit crops, scan strips, ghost layers, channel fragments
 and snippets from previous uploads. Text documents inherit phrases; other files
 inherit payload bytes. Each render still uses a random recipe and order of
