@@ -1,14 +1,10 @@
 services:
   - type: web
     name: glitch-telegram-bot
-    runtime: python
+    runtime: docker
     plan: free
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python glitch_bot.py
     autoDeployTrigger: commit
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.13.10"
       - key: BOT_TOKEN
         sync: false
