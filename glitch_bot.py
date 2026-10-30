@@ -611,7 +611,8 @@ async def process_upload(data, filename, level, artifacts, translate=False, mode
                     run_content_job, data, os.path.splitext(name)[1], level, artifacts)
             filename = os.path.splitext(filename)[0] + extension
             return result, recipe, artifact, format_notices, filename
-        except ContentUnavailable:
+        except ContentUnavailable as exc:
+            logger.warning("Content fusion unavailable: %s", exc)
             notices.append("Content decoding unavailable; used destructive byte chaos. Check the Docker decoder setup.")
             result, recipe = await asyncio.to_thread(glitch_router, data, filename, level, artifacts, fusion)
     else:

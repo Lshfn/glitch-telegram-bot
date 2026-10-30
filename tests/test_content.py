@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import closing
 import os
 import random
 import shutil
@@ -166,7 +167,7 @@ class MigrationTests(unittest.TestCase):
     def test_old_database_upgrades_and_preferences_do_not_reset_each_other(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "old.sqlite3"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.executescript("""
                     CREATE TABLE artifacts (chat TEXT,digest TEXT,touched REAL,level INTEGER,
                         image BLOB,text TEXT,sample BLOB,PRIMARY KEY(chat,digest));
@@ -174,6 +175,7 @@ class MigrationTests(unittest.TestCase):
                 """)
                 import time
                 db.execute("INSERT INTO artifacts VALUES (?,?,?,1,?,?,?)", ("a", "x", time.time(), b"", '["old words"]', b"old"))
+                db.commit()
             memory = ArtifactMemory(path)
             self.assertEqual(memory.snapshot("a", "x")[1][0].text, ("old words",))
             memory.translations("a", True)

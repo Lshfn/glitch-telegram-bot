@@ -97,7 +97,7 @@ def run_content_job(data, extension, level, artifacts):
                 metadata["notices"], metadata["extension"])
 
 
-def run_tool(args, timeout=20):
+def run_tool(args, timeout=20, stage="decode"):
     if not shutil.which(args[0]):
         raise ContentUnavailable("A required local decoder is missing; use the Docker setup.")
     try:
@@ -108,7 +108,7 @@ def run_tool(args, timeout=20):
     except subprocess.CalledProcessError as exc:
         if exc.returncode in (-signal.SIGKILL, -signal.SIGXCPU, -signal.SIGXFSZ):
             raise ContentLimitError("A document/media decoder exceeded its resource budget. Try a smaller file.")
-        raise ContentUnavailable("The file could not be decoded locally.")
+        raise ContentUnavailable(f"{args[0]} {stage} failed (exit {exc.returncode}).")
 
 
 def contact_sheet(images):
@@ -255,7 +255,7 @@ def audio_decode(path, seconds):
     run_tool(["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "1",
               "-protocol_whitelist", "file,pipe", "-format_whitelist", INPUT_FORMATS,
               "-i", str(path), "-map", "0:a:0", "-vn", "-t", str(seconds + 1),
-              "-ac", "2", "-ar", str(SAMPLE_RATE), "-f", "f32le", str(output)])
+              "-ac", "2", "-ar", str(SAMPLE_RATE), "-f", "f32le", str(output)], stage="audio decode")
     if output.stat().st_size > (seconds * SAMPLE_RATE + SAMPLE_RATE // 20) * 8:
         raise ContentLimitError(f"Audio exceeds the {seconds}-second content limit.")
     samples = np.fromfile(output, dtype="<f4").reshape(-1, 2)
@@ -317,7 +317,7 @@ def media_content(path, extension, level, artifacts, render):
               "-i", str(path), "-map", "0:v:0", "-an", "-t", str(maximum + 1),
               "-vf", f"fps={VIDEO_FPS},scale=480:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
               "-frames:v", str(maximum * VIDEO_FPS + 1), "-threads", "1",
-              str(frames_dir / "%04d.png")])
+              str(frames_dir / "%04d.png")], stage="video decode")
     frames = sorted(frames_dir.glob("*.png"))
     if len(frames) > maximum * VIDEO_FPS:
         raise ContentLimitError(f"Video exceeds the {maximum}-second content limit.")
@@ -365,7 +365,7 @@ def media_content(path, extension, level, artifacts, render):
     command += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-threads", "1", "-preset", "veryfast", "-tune", "zerolatency",
                 "-x264-params", "threads=1:lookahead_threads=1:sync-lookahead=0:rc-lookahead=0",
                 "-crf", "26", "-movflags", "+faststart", "-t", str(len(frames) / VIDEO_FPS), str(target)]
-    run_tool(command, timeout=25)
+    run_tool(command, timeout=25, stage="video encode")
     result = target.read_bytes()
     artifact = merge_traces(source, trace(result, image=contact_sheet(previews), waveform=audio_output))
     return (result, list(dict.fromkeys(labels)), artifact,
