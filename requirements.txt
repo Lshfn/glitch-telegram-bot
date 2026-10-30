@@ -3,3 +3,5 @@ Pillow==11.3.0
 python-dotenv==1.2.2
 aiohttp>=3.9,<4
 pytesseract==0.3.13
+numpy>=2.2,<3
+lxml>=5,<7

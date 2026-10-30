@@ -18,6 +18,7 @@ class Artifact:
     image: bytes = b""
     text: tuple[str, ...] = ()
     sample: bytes = b""
+    signal: bytes = b""  # at most 2048 int16 values derived from decoded content
 
 
 def open_image(data):
@@ -70,6 +71,15 @@ class ArtifactMemory:
                     chat TEXT PRIMARY KEY, translate_enabled INTEGER NOT NULL,
                     touched REAL NOT NULL);
             """)
+            # Upgrade existing histories in place; the old effects remain donors.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(artifacts)")}
+            if "signal" not in columns:
+                db.execute("ALTER TABLE artifacts ADD COLUMN signal BLOB NOT NULL DEFAULT X''")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(preferences)")}
+            if "mode" not in columns:
+                db.execute("ALTER TABLE preferences ADD COLUMN mode TEXT NOT NULL DEFAULT 'fuse'")
+            if "chaos" not in columns:
+                db.execute("ALTER TABLE preferences ADD COLUMN chaos INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def _db(self):
@@ -98,16 +108,18 @@ class ArtifactMemory:
             self._prune(db)
             row = db.execute("SELECT level FROM artifacts WHERE chat=? AND digest=?",
                              (str(chat), digest)).fetchone()
-            rows = db.execute("SELECT image,text,sample FROM artifacts WHERE chat=? "
+            rows = db.execute("SELECT image,text,sample,signal FROM artifacts WHERE chat=? "
                               "ORDER BY touched DESC LIMIT ?", (str(chat), self.per_chat)).fetchall()
         return min(12, (row[0] if row else 0) + 1), [
-            Artifact(image, tuple(json.loads(text)), sample) for image, text, sample in rows]
+            Artifact(image, tuple(json.loads(text)), sample, signal) for image, text, sample, signal in rows]
 
     def remember(self, chat, digest, level, artifact):
         with self.lock, self._db() as db:
-            db.execute("INSERT OR REPLACE INTO artifacts VALUES (?,?,?,?,?,?,?)",
+            db.execute("INSERT OR REPLACE INTO artifacts "
+                       "(chat,digest,touched,level,image,text,sample,signal) VALUES (?,?,?,?,?,?,?,?)",
                        (str(chat), digest, time.time(), level, artifact.image,
-                        json.dumps(artifact.text, ensure_ascii=False), artifact.sample))
+                        json.dumps(artifact.text[:5], ensure_ascii=False), artifact.sample[:4096],
+                        artifact.signal[:4096]))
             db.execute("DELETE FROM artifacts WHERE chat=? AND rowid NOT IN "
                        "(SELECT rowid FROM artifacts WHERE chat=? ORDER BY touched DESC LIMIT ?)",
                        (str(chat), str(chat), self.per_chat))
@@ -117,10 +129,30 @@ class ArtifactMemory:
         with self.lock, self._db() as db:
             self._prune(db)
             if enabled is not None:
-                db.execute("INSERT OR REPLACE INTO preferences VALUES (?,?,?)",
+                db.execute("INSERT INTO preferences (chat,translate_enabled,touched) VALUES (?,?,?) "
+                           "ON CONFLICT(chat) DO UPDATE SET translate_enabled=excluded.translate_enabled, "
+                           "touched=excluded.touched",
                            (str(chat), int(enabled), time.time()))
             row = db.execute("SELECT translate_enabled FROM preferences WHERE chat=?", (str(chat),)).fetchone()
         return bool(row and row[0])
+
+    def settings(self, chat, mode=None, chaos=None):
+        if mode is not None and mode not in ("fuse", "raw"):
+            raise ValueError("Mode must be fuse or raw")
+        if chaos is not None and (not isinstance(chaos, int) or not 0 <= chaos <= 12):
+            raise ValueError("Chaos must be 0 (auto) or 1–12")
+        with self.lock, self._db() as db:
+            self._prune(db)
+            if mode is not None or chaos is not None:
+                db.execute("INSERT INTO preferences (chat,translate_enabled,touched) VALUES (?,0,?) "
+                           "ON CONFLICT(chat) DO UPDATE SET touched=excluded.touched",
+                           (str(chat), time.time()))
+                if mode is not None:
+                    db.execute("UPDATE preferences SET mode=? WHERE chat=?", (mode, str(chat)))
+                if chaos is not None:
+                    db.execute("UPDATE preferences SET chaos=? WHERE chat=?", (chaos, str(chat)))
+            row = db.execute("SELECT mode,chaos FROM preferences WHERE chat=?", (str(chat),)).fetchone()
+        return tuple(row) if row else ("fuse", 0)
 
     def forget(self, chat):
         with self.lock, self._db() as db:
