@@ -359,45 +359,104 @@ class WorkerDeadlineTests(unittest.TestCase):
 
 
 class HandlerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_mode_and_chaos_commands_are_persistent_and_sender_scoped(self):
-        message = SimpleNamespace(chat=SimpleNamespace(id=1), from_user=SimpleNamespace(id=2), answer=AsyncMock())
+    async def test_instructions_and_processing_commands_are_removed_but_forget_still_works(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1), from_user=SimpleNamespace(id=2),
+                                  photo=[], video=None, audio=None, voice=None, video_note=None,
+                                  animation=None, document=None, answer=AsyncMock())
         with tempfile.TemporaryDirectory() as root:
             memory = ArtifactMemory(Path(root) / "memory.sqlite3")
+            memory.remember("1:2", "old", 7, Artifact(text=("old fragment",)))
+            memory.remember("1:3", "other", 4, Artifact(text=("other sender",)))
             with patch.object(engine, "memory", memory):
-                for command in ("/mode raw", "/chaos 12"):
+                for command in ("/start", "/help@glitch_bot"):
                     message.text = command
                     await engine.handle_file(message)
-                self.assertEqual(memory.settings("1:2"), ("raw", 12))
-                self.assertEqual(memory.settings("1:3"), ("fuse", 0))
-                message.text = "/chaos auto"
-                await engine.handle_file(message)
-                self.assertEqual(memory.settings("1:2"), ("raw", 0))
-                message.text = "/chaos 99"
-                await engine.handle_file(message)
-                self.assertEqual(memory.settings("1:2"), ("raw", 0))
+                self.assertEqual([call.args[0] for call in message.answer.await_args_list], ["✶", "✶"])
+                message.answer.reset_mock()
+                for text in ("hello", "/mode raw", "/mode fuse", "/chaos 12", "/chaos auto", "/status"):
+                    message.text = text
+                    await engine.handle_file(message)
+                message.answer.assert_not_awaited()
+                self.assertEqual(memory.settings("1:2"), ("fuse", 0))
                 message.text = "/forget"
                 await engine.handle_file(message)
-                self.assertEqual(memory.settings("1:2"), ("fuse", 0))
+                self.assertEqual(memory.snapshot("1:2", "old"), (1, []))
+                self.assertEqual(len(memory.snapshot("1:3", "other")[1]), 1)
+                message.answer.assert_awaited_once_with("Memory cleared.")
 
-    async def test_voice_upload_and_sender_settings_reach_the_processor(self):
+    def test_automatic_intensity_varies_reaches_maximum_and_escalates(self):
+        random.seed(101)
+        levels = {engine.automatic_intensity(1) for _ in range(80)}
+        self.assertTrue(all(4 <= level <= 12 for level in levels))
+        self.assertGreater(len(levels), 5)
+        self.assertIn(12, levels)
+        for repeat_level in range(4, 13):
+            for _ in range(10):
+                self.assertTrue(repeat_level <= engine.automatic_intensity(repeat_level) <= 12)
+
+    async def test_voice_upload_is_automatic_ignores_legacy_settings_and_has_no_caption(self):
         upload = SimpleNamespace(file_size=128, file_id="voice", file_name=None)
         message = SimpleNamespace(chat=SimpleNamespace(id=1), from_user=SimpleNamespace(id=2),
                                   text=None, photo=[], video=None, audio=None, voice=upload,
                                   video_note=None, animation=None, document=None,
                                   answer=AsyncMock(), reply_document=AsyncMock())
         bot = SimpleNamespace(get_file=AsyncMock(return_value=SimpleNamespace(file_path="voice.ogg")),
-                              download_file=AsyncMock(return_value=BytesIO(b"uploaded bytes")))
+                              download_file=AsyncMock(side_effect=lambda _: BytesIO(b"uploaded bytes")))
         with tempfile.TemporaryDirectory() as root:
             memory = ArtifactMemory(Path(root) / "memory.sqlite3")
-            memory.settings("1:2", mode="raw", chaos=12)
-            processor = AsyncMock(return_value=(b"result", ["byte chaos"], Artifact(sample=b"trace"), [], "voice.ogg"))
+            memory.settings("1:2", mode="raw", chaos=1)
+            processor = AsyncMock(return_value=(b"result", ["spectral vocoder"], Artifact(sample=b"trace"),
+                                               ["Technical processing notice"], "voice.wav"))
             with patch.object(engine, "memory", memory), patch.object(engine, "bot", bot), patch.object(engine, "process_upload", processor):
                 await engine.handle_file(message)
-            self.assertEqual(processor.call_args.args[1:3], ("voice.ogg", 12))
-            self.assertEqual(processor.call_args.args[-1], "raw")
-            message.reply_document.assert_awaited_once()
+                first_level = processor.call_args.args[2]
+                self.assertTrue(4 <= first_level <= 12)
+                self.assertEqual(processor.call_args.args[1], "voice.ogg")
+                self.assertEqual(processor.call_args.args[3:], ([], False))
+                await engine.handle_file(message)
+                self.assertGreaterEqual(processor.call_args.args[2], min(12, first_level + 1))
+                self.assertEqual(len(processor.call_args.args[3]), 1)
+            self.assertEqual(message.reply_document.await_count, 2)
+            for call in message.reply_document.await_args_list:
+                self.assertIsNone(call.kwargs.get("caption"))
+                self.assertEqual(call.args[0].filename, "glitched_voice.wav")
+            message.answer.assert_not_awaited()
             self.assertEqual(len(memory.snapshot("1:2", "")[1]), 1)
             self.assertEqual(memory.snapshot("1:3", "")[1], [])
+            self.assertFalse(memory.translations("1:2"))
+
+    async def test_optional_translation_controls_keep_sender_consent(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=1), from_user=SimpleNamespace(id=2), answer=AsyncMock())
+        with tempfile.TemporaryDirectory() as root:
+            memory = ArtifactMemory(Path(root) / "memory.sqlite3")
+            with patch.object(engine, "memory", memory), patch.object(engine, "translator", SimpleNamespace(configured=True)):
+                message.text = "/translate on"
+                await engine.handle_file(message)
+                self.assertTrue(memory.translations("1:2"))
+                self.assertFalse(memory.translations("1:3"))
+                message.text = "/translate off"
+                await engine.handle_file(message)
+                self.assertFalse(memory.translations("1:2"))
+            self.assertEqual([call.args[0] for call in message.answer.await_args_list],
+                             ["Translation on.", "Translation off."])
+
+    async def test_startup_clears_old_command_menu_for_webhook_and_polling(self):
+        bot = SimpleNamespace(delete_my_commands=AsyncMock(), set_webhook=AsyncMock(), delete_webhook=AsyncMock())
+        with patch.dict(os.environ, {"RENDER_EXTERNAL_URL": "https://example.test/"}):
+            await engine.on_render_startup(bot)
+        bot.delete_my_commands.assert_awaited_once_with()
+        bot.set_webhook.assert_awaited_once()
+        bot.delete_my_commands.reset_mock()
+        with patch.object(engine, "bot", bot), patch.object(engine.dp, "start_polling", AsyncMock()) as polling:
+            await engine.run_local_polling()
+        bot.delete_my_commands.assert_awaited_once_with()
+        bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+        polling.assert_awaited_once_with(bot)
+
+    async def test_menu_cleanup_failure_does_not_prevent_startup(self):
+        bot = SimpleNamespace(delete_my_commands=AsyncMock(side_effect=RuntimeError("offline")))
+        await engine.clear_command_menu(bot)
+        bot.delete_my_commands.assert_awaited_once()
 
     async def test_failed_delivery_is_never_remembered(self):
         upload = SimpleNamespace(file_size=128, file_id="file", file_name="paper.pdf")
