@@ -13,9 +13,11 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 import aiohttp
 
-from artifact_memory import ArtifactMemory, extract_artifact, open_image
+from artifact_memory import ArtifactMemory, open_image
 from language_glitch import Translator, TEXT_EXTENSIONS, decode_text, read_regions
 from memory_effects import inherit_image, inherit_bytes, glitch_text
+from content_fusion import trace, merge_traces, fuse_image, fuse_text, fuse_bytes
+from file_formats import CONTENT_EXTENSIONS, ContentLimitError, ContentUnavailable, run_content_job
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -27,6 +29,7 @@ memory = ArtifactMemory(os.getenv("MEMORY_DB", "data/artifacts.sqlite3"))
 translator = Translator(os.getenv("TRANSLATE_URL", ""), os.getenv("TRANSLATE_API_KEY", ""),
                         [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()])
 processing_slots = asyncio.Semaphore(2)
+content_slots = asyncio.Semaphore(1)
 chat_locks = weakref.WeakValueDictionary()
 logger = logging.getLogger(__name__)
 MAX_UPLOAD = 10 * 1024 * 1024
@@ -492,8 +495,10 @@ def jpeg_databend(data, strength):
         return original
 
 
-def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=None):
+def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=None, source=None, fusion=True):
     img = prepared.copy() if prepared is not None else open_image(data)
+    if fusion and source is None:
+        source = trace(data, image=img)
     recipe, strength = make_glitch_recipe(intensity)
 
     # Inheritance can enter before or after the current upload's own effects.
@@ -508,6 +513,10 @@ def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=No
         # same intensity do not collapse into the same visual grammar.
         stage_strength = min(1.0, max(0.05, strength * random.uniform(0.65, 1.35)))
         img = EFFECTS[name](img, stage_strength)
+
+    if fusion:
+        img, mathematics = fuse_image(img, source, artifacts, intensity)
+        recipe.extend(mathematics)
 
     if not memory_first:
         img, inherited = inherit_image(img, artifacts, strength)
@@ -531,26 +540,35 @@ def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=No
 # ---------------------------------------------------------------------------
 # ROUTER
 # ---------------------------------------------------------------------------
-def glitch_router(data, name, intensity, artifacts=()):
+def glitch_router(data, name, intensity, artifacts=(), fusion=True):
     name = (name or "file.bin").lower()
 
     if name.endswith((".jpg", ".jpeg")):
-        return glitch_image(data, intensity, "JPEG", artifacts)
+        return glitch_image(data, intensity, "JPEG", artifacts, fusion=fusion)
 
     if name.endswith(".png"):
-        return glitch_image(data, intensity, "PNG", artifacts)
+        return glitch_image(data, intensity, "PNG", artifacts, fusion=fusion)
 
     data, inherited = inherit_bytes(data, artifacts, intensity)
-    return corrupt_bytes(data, intensity), inherited + ["byte chaos"]
+    result = corrupt_bytes(data, intensity)
+    recipe = inherited + ["byte chaos"]
+    if fusion:
+        result, maths = fuse_bytes(result, trace(data), artifacts, intensity)
+        recipe.extend(maths)
+    return result, recipe
 
 
-async def process_upload(data, filename, level, artifacts, translate=False):
+async def process_upload(data, filename, level, artifacts, translate=False, mode="fuse"):
     name = filename.lower()
     notices, translated, failures = [], [], 0
     artifact_text = ""
+    source = None
+    image = None
+    fusion = mode != "raw"
     is_image = name.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"))
     if is_image:
         image = await asyncio.to_thread(open_image, data)
+        original_image = image.copy()
         if translate and translator.configured:
             try:
                 regions = await asyncio.to_thread(read_regions, image)
@@ -564,11 +582,13 @@ async def process_upload(data, filename, level, artifacts, translate=False):
                 notices.append("Image translation unavailable (OCR setup or time limit).")
                 logger.warning("OCR/translation skipped: %s", type(exc).__name__)
         output_format = "JPEG" if name.endswith((".jpg", ".jpeg")) else "PNG"
-        result, recipe = await asyncio.to_thread(glitch_image, data, level, output_format, artifacts, image)
+        source = await asyncio.to_thread(trace, data, artifact_text, original_image)
+        result, recipe = await asyncio.to_thread(glitch_image, data, level, output_format, artifacts, image, source, fusion)
         if output_format == "PNG" and not name.endswith(".png"):
             filename = os.path.splitext(filename)[0] + ".png"
     elif name.endswith(TEXT_EXTENSIONS):
         text, _encoding = decode_text(data)
+        source = await asyncio.to_thread(trace, data, text)
         if translate and translator.configured:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -576,16 +596,35 @@ async def process_upload(data, filename, level, artifacts, translate=False):
                         text, translated, failures = await translator.replace_spans(text, session)
             except asyncio.TimeoutError:
                 notices.append("Translation time limit reached; text glitches still applied.")
-        text, recipe = await asyncio.to_thread(glitch_text, text, artifacts, level)
+        recipe = []
+        if fusion:
+            text, maths = await asyncio.to_thread(fuse_text, text, source, artifacts, level)
+            recipe.extend(maths)
+        text, inherited = await asyncio.to_thread(glitch_text, text, artifacts, level)
+        recipe.extend(inherited)
         artifact_text = text
         result = text.encode("utf-8")
+    elif fusion and name.endswith(CONTENT_EXTENSIONS):
+        try:
+            async with content_slots:
+                result, recipe, artifact, format_notices, extension = await asyncio.to_thread(
+                    run_content_job, data, os.path.splitext(name)[1], level, artifacts)
+            filename = os.path.splitext(filename)[0] + extension
+            return result, recipe, artifact, format_notices, filename
+        except ContentUnavailable:
+            notices.append("Content decoding unavailable; used destructive byte chaos. Check the Docker decoder setup.")
+            result, recipe = await asyncio.to_thread(glitch_router, data, filename, level, artifacts, fusion)
     else:
-        result, recipe = await asyncio.to_thread(glitch_router, data, filename, level, artifacts)
+        result, recipe = await asyncio.to_thread(glitch_router, data, filename, level, artifacts, fusion)
     if translated:
         recipe.append("translations: " + ", ".join(translated))
     if failures:
         notices.append("Some translations failed; remaining glitches still applied.")
-    artifact = await asyncio.to_thread(extract_artifact, result, artifact_text, is_image)
+    if source is None:
+        source = await asyncio.to_thread(trace, data)
+    rendered_image = await asyncio.to_thread(open_image, result) if is_image else None
+    artifact = await asyncio.to_thread(trace, result, artifact_text, rendered_image)
+    artifact = await asyncio.to_thread(merge_traces, source, artifact)
     return result, recipe, artifact, notices, filename
 
 
@@ -601,9 +640,12 @@ async def handle_file(message: types.Message):
     async with chat_lock(scope):
         if action in ("/start", "/help"):
             await message.answer(
-                "Send an image, video or file. Later uploads inherit fragments of your earlier ones "
+                "Send images, DOCX/PDF, video, audio or other files. Later uploads inherit fragments of your earlier ones "
                 "in this chat (up to 24 recent files, seven days). Text files stay readable UTF-8.\n"
                 "/forget — erase your stored fragments and reset intensity\n"
+                "/chaos 12 — maximum intensity now; /chaos auto — escalation on repeats\n"
+                "/mode fuse — decoded content and mathematical fusion (default)\n"
+                "/mode raw — original effects and destructive file-byte glitches\n"
                 "/translate on — enable random translations via the configured service\n"
                 "/translate off — disable translations\n"
                 "/status — show memory, translation and OCR availability"
@@ -611,7 +653,27 @@ async def handle_file(message: types.Message):
             return
         if action == "/forget":
             await asyncio.to_thread(memory.forget, scope)
-            await message.answer("Your stored fragments and intensity history here are erased. Translation is off.")
+            await message.answer("Your stored fragments and intensity history here are erased. Translation is off; mode is fuse and chaos is auto.")
+            return
+        if action == "/mode":
+            option = command[1].lower() if len(command) > 1 else ""
+            if option not in ("fuse", "raw"):
+                await message.answer("Use /mode fuse for decoded content, or /mode raw for the original destructive effects.")
+                return
+            await asyncio.to_thread(memory.settings, scope, mode=option)
+            await message.answer("Mode: " + option + ".")
+            return
+        if action == "/chaos":
+            option = command[1].lower() if len(command) > 1 else ""
+            if option == "auto":
+                value = 0
+            elif len(option) <= 2 and option.isascii() and option.isdigit() and 1 <= int(option) <= 12:
+                value = int(option)
+            else:
+                await message.answer("Use /chaos 1 through /chaos 12, or /chaos auto.")
+                return
+            await asyncio.to_thread(memory.settings, scope, chaos=value)
+            await message.answer("Chaos: " + (str(value) if value else "auto; repeated content escalates") + ".")
             return
         if action == "/translate":
             option = command[1].lower() if len(command) > 1 else ""
@@ -632,23 +694,30 @@ async def handle_file(message: types.Message):
             import shutil
             _, history = await asyncio.to_thread(memory.snapshot, scope, "")
             enabled = await asyncio.to_thread(memory.translations, scope)
+            mode, chaos = await asyncio.to_thread(memory.settings, scope)
             await message.answer(
                 f"Stored traces: {len(history)}/24 (your uploads in this chat only).\n"
+                f"Mode: {mode}; chaos: {chaos or 'auto'}.\n"
                 f"Translation service: {'configured' if translator.configured else 'not configured'}; "
                 f"your mode: {'on' if enabled else 'off'}.\n"
-                f"OCR executable: {'available' if shutil.which('tesseract') else 'missing; use Docker setup'}."
+                f"OCR executable: {'available' if shutil.which('tesseract') else 'missing; use Docker setup'}.\n"
+                f"Media decoder: {'available' if shutil.which('ffmpeg') and shutil.which('ffprobe') else 'missing; use Docker setup'}.\n"
+                f"PDF decoder: {'available' if all(shutil.which(t) for t in ('pdfinfo', 'pdftotext', 'pdftoppm')) else 'missing; use Docker setup'}."
             )
             return
 
-        upload = message.photo[-1] if message.photo else message.video or message.document
+        upload = (message.photo[-1] if message.photo else message.video or message.audio or
+                  message.voice or message.video_note or message.animation or message.document)
         if not upload:
-            await message.answer("Send an image / video / file, or /help.")
+            await message.answer("Send an image / video / audio / file, or /help.")
             return
         if upload.file_size and upload.file_size > MAX_UPLOAD:
             await message.answer("Please send a file smaller than 10 MB.")
             return
-        filename = ("image.jpg" if message.photo else
-                    (message.document.file_name or "file.bin") if message.document else "video.mp4")
+        filename = "image.jpg" if message.photo else getattr(upload, "file_name", None)
+        if not filename:
+            filename = ("voice.ogg" if message.voice else "audio.mp3" if message.audio else
+                        "video.mp4" if message.video or message.video_note or message.animation else "file.bin")
         # Strip client-supplied directory components from the reply filename.
         filename = filename.replace("\\", "/").rsplit("/", 1)[-1][:180] or "file.bin"
         async with processing_slots:
@@ -665,8 +734,10 @@ async def handle_file(message: types.Message):
                 digest = memory.digest(data)
                 level, history = await asyncio.to_thread(memory.snapshot, scope, digest)
                 enabled = await asyncio.to_thread(memory.translations, scope)
+                mode, chaos = await asyncio.to_thread(memory.settings, scope)
+                level = chaos or level
                 result, recipe, artifact, notices, filename = await process_upload(
-                    data, filename, level, history, enabled)
+                    data, filename, level, history, enabled, mode)
                 await message.reply_document(
                     BufferedInputFile(result, filename="glitched_" + filename),
                     caption="\n".join(notices)[:900] or None,
@@ -674,6 +745,8 @@ async def handle_file(message: types.Message):
                 # Failed processing/delivery never becomes a donor for later files.
                 await asyncio.to_thread(memory.remember, scope, digest, level, artifact)
                 logger.info("Glitch level=%s effects=%s", level, recipe)
+            except ContentLimitError as exc:
+                await message.answer(str(exc))
             except Exception as exc:
                 # Do not log uploaded names, OCR text, file bytes or provider keys.
                 logger.warning("Glitch failed: %s", type(exc).__name__)
