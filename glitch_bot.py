@@ -46,6 +46,12 @@ def chat_lock(chat):
 MAX_INTENSITY = 12
 
 
+def automatic_intensity(repeat_level):
+    """Vary the force of each upload; repeated content keeps escalating."""
+    minimum = min(MAX_INTENSITY, max(4, repeat_level))
+    return random.randint(minimum, MAX_INTENSITY)
+
+
 # ---------------------------------------------------------------------------
 # GENERIC BYTE CHAOS (GIF / MP4 / unknown files)
 # ---------------------------------------------------------------------------
@@ -640,80 +646,29 @@ async def handle_file(message: types.Message):
     action = command[0].split("@")[0].lower() if command else ""
     async with chat_lock(scope):
         if action in ("/start", "/help"):
-            await message.answer(
-                "Send images, DOCX/PDF, video, audio or other files. Later uploads inherit fragments of your earlier ones "
-                "in this chat (up to 24 recent files, seven days). Text files stay readable UTF-8.\n"
-                "/forget — erase your stored fragments and reset intensity\n"
-                "/chaos 12 — maximum intensity now; /chaos auto — escalation on repeats\n"
-                "/mode fuse — decoded content and mathematical fusion (default)\n"
-                "/mode raw — original effects and destructive file-byte glitches\n"
-                "/translate on — enable random translations via the configured service\n"
-                "/translate off — disable translations\n"
-                "/status — show memory, translation and OCR availability"
-            )
+            await message.answer("✶")
             return
         if action == "/forget":
             await asyncio.to_thread(memory.forget, scope)
-            await message.answer("Your stored fragments and intensity history here are erased. Translation is off; mode is fuse and chaos is auto.")
-            return
-        if action == "/mode":
-            option = command[1].lower() if len(command) > 1 else ""
-            if option not in ("fuse", "raw"):
-                await message.answer("Use /mode fuse for decoded content, or /mode raw for the original destructive effects.")
-                return
-            await asyncio.to_thread(memory.settings, scope, mode=option)
-            await message.answer("Mode: " + option + ".")
-            return
-        if action == "/chaos":
-            option = command[1].lower() if len(command) > 1 else ""
-            if option == "auto":
-                value = 0
-            elif len(option) <= 2 and option.isascii() and option.isdigit() and 1 <= int(option) <= 12:
-                value = int(option)
-            else:
-                await message.answer("Use /chaos 1 through /chaos 12, or /chaos auto.")
-                return
-            await asyncio.to_thread(memory.settings, scope, chaos=value)
-            await message.answer("Chaos: " + (str(value) if value else "auto; repeated content escalates") + ".")
+            await message.answer("Memory cleared.")
             return
         if action == "/translate":
             option = command[1].lower() if len(command) > 1 else ""
             if option not in ("on", "off"):
-                await message.answer("Use /translate on or /translate off. Only selected text/OCR snippets go to the configured translation service.")
                 return
             if option == "on" and not translator.configured:
-                await message.answer("Translation needs TRANSLATE_URL configured by the bot owner. Image translation also needs local Tesseract (see README).")
+                await message.answer("Translation unavailable.")
                 return
             await asyncio.to_thread(memory.translations, scope, option == "on")
-            await message.answer(
-                "Translation on: selected text snippets and locally recognized image text will be sent to "
-                + translator.url + ". Use /translate off to stop."
-                if option == "on" else "Translation off."
-            )
-            return
-        if action == "/status":
-            import shutil
-            _, history = await asyncio.to_thread(memory.snapshot, scope, "")
-            enabled = await asyncio.to_thread(memory.translations, scope)
-            mode, chaos = await asyncio.to_thread(memory.settings, scope)
-            await message.answer(
-                f"Stored traces: {len(history)}/24 (your uploads in this chat only).\n"
-                f"Mode: {mode}; chaos: {chaos or 'auto'}.\n"
-                f"Translation service: {'configured' if translator.configured else 'not configured'}; "
-                f"your mode: {'on' if enabled else 'off'}.\n"
-                f"OCR executable: {'available' if shutil.which('tesseract') else 'missing; use Docker setup'}.\n"
-                f"Media decoder: {'available' if shutil.which('ffmpeg') and shutil.which('ffprobe') else 'missing; use Docker setup'}.\n"
-                f"PDF decoder: {'available' if all(shutil.which(t) for t in ('pdfinfo', 'pdftotext', 'pdftoppm')) else 'missing; use Docker setup'}."
-            )
+            await message.answer("Translation on." if option == "on" else "Translation off.")
             return
 
         upload = (message.photo[-1] if message.photo else message.video or message.audio or
                   message.voice or message.video_note or message.animation or message.document)
         if not upload:
-            await message.answer("Send an image / video / audio / file, or /help.")
             return
         if upload.file_size and upload.file_size > MAX_UPLOAD:
-            await message.answer("Please send a file smaller than 10 MB.")
+            await message.answer("File exceeds 10 MB.")
             return
         filename = "image.jpg" if message.photo else getattr(upload, "file_name", None)
         if not filename:
@@ -727,31 +682,31 @@ async def handle_file(message: types.Message):
                 stream = await bot.download_file(file.file_path)
                 data = stream.read(MAX_UPLOAD + 1)
                 if len(data) > MAX_UPLOAD:
-                    await message.answer("Please send a file smaller than 10 MB.")
+                    await message.answer("File exceeds 10 MB.")
                     return
                 if filename.lower().endswith(TEXT_EXTENSIONS) and len(data) > 512 * 1024:
-                    await message.answer("Text files must be smaller than 512 KB.")
+                    await message.answer("Text file exceeds 512 KB.")
                     return
                 digest = memory.digest(data)
                 level, history = await asyncio.to_thread(memory.snapshot, scope, digest)
                 enabled = await asyncio.to_thread(memory.translations, scope)
-                mode, chaos = await asyncio.to_thread(memory.settings, scope)
-                level = chaos or level
+                level = automatic_intensity(level)
                 result, recipe, artifact, notices, filename = await process_upload(
-                    data, filename, level, history, enabled, mode)
+                    data, filename, level, history, enabled)
                 await message.reply_document(
                     BufferedInputFile(result, filename="glitched_" + filename),
-                    caption="\n".join(notices)[:900] or None,
                 )
                 # Failed processing/delivery never becomes a donor for later files.
                 await asyncio.to_thread(memory.remember, scope, digest, level, artifact)
                 logger.info("Glitch level=%s effects=%s", level, recipe)
+                for notice in notices:
+                    logger.info("Processing notice: %s", notice)
             except ContentLimitError as exc:
                 await message.answer(str(exc))
             except Exception as exc:
                 # Do not log uploaded names, OCR text, file bytes or provider keys.
                 logger.warning("Glitch failed: %s", type(exc).__name__)
-                await message.answer("The glitch collapsed too hard. Try a smaller file or send it again.")
+                await message.answer("The glitch collapsed.")
 
 
 # ---------------------------------------------------------------------------
@@ -768,12 +723,21 @@ async def healthcheck(request):
     return web.Response(text="glitch bot alive")
 
 
+async def clear_command_menu(bot: Bot):
+    """Remove the old default Telegram command menu after deployment."""
+    try:
+        await bot.delete_my_commands()
+    except Exception as exc:
+        logger.warning("Command menu cleanup failed: %s", type(exc).__name__)
+
+
 async def on_render_startup(bot: Bot):
     """Register Telegram webhook when running as a Render web service."""
     base_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not base_url:
         raise RuntimeError("RENDER_EXTERNAL_URL is missing on Render")
 
+    await clear_command_menu(bot)
     webhook_url = f"{base_url}{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
@@ -787,6 +751,7 @@ async def run_local_polling():
     """Convenient local mode: `python glitch_bot.py` still works off Render."""
     # Telegram cannot use getUpdates while a webhook is configured.
     await bot.delete_webhook(drop_pending_updates=False)
+    await clear_command_menu(bot)
     print("GLITCH BOT STARTED IN LOCAL POLLING MODE")
     await dp.start_polling(bot)
 

@@ -16,13 +16,20 @@ can return inside later uploads.
 
 The original eleven image effects, JPEG databend, phrase inheritance, translations
 and byte chaos remain. Each render chooses a different recipe and order.
-Reuploading the same content increases intensity, even if Telegram gives it a
-different file ID. Use `/chaos 12` to reach maximum intensity immediately;
-`/chaos auto` restores escalation on repeated content.
+Processing is automatic: the bot selects the route from the file type, and its
+content and earlier uploads supply the transformation material. Intensity varies
+between 4 and 12 on the first upload; reuploading the same content raises its
+minimum intensity, even if Telegram gives it a different file ID.
+
+There is no setup dialogue, processing command menu or technical caption on
+returned files. `/start` and `/help` reply with a single symbol. Other text is
+ignored unless it is one of the optional memory/translation controls below.
+The old default Telegram command menu is cleared at startup in both webhook and
+polling deployments. Existing `/mode` and `/chaos` preferences are ignored.
 
 ## Content fusion
 
-`/mode fuse` is the default. Transformations work on decoded file content and
+Transformations work on decoded file content automatically and
 rebuild the file in the format below. Ordinary Telegram audio, voice messages,
 animations and video notes are accepted as well as file attachments.
 
@@ -53,15 +60,12 @@ fields, phases, kernels and words. This also works on the first upload, using
 its own content; later uploads contribute additional material. Image mathematics
 uses a working grid up to 768 px and returns to the image's processing dimensions.
 
-`/mode raw` restores the earlier processing route: existing image/text effects
-and inherited byte fragments followed by byte chaos for documents, audio, video,
-GIF and unknown files. Those binary outputs may be unreadable. In content mode,
-an unavailable/failed decoder also uses this destructive fallback, with an
-explicit caption. A processing-limit overrun is reported without returning a
-truncated or silently corrupted substitute.
-
-The mode and chaos settings apply to one sender in one chat, survive restarts
-when the database survives, and reset with `/forget`.
+Existing image/text effects are combined with content fusion. Byte chaos remains
+the route for unknown files and a fallback when a document/media decoder is
+unavailable or fails. Those binary outputs may be unreadable. Processing notices
+go to server logs instead of file captions. A processing-limit overrun is still
+reported without returning a truncated substitute. The earlier raw route also
+remains available internally to the engine; users do not choose processing modes.
 
 ## Memory
 
@@ -75,8 +79,8 @@ and filenames are not stored in the history. Temporary decoder files are deleted
 after processing. Effects from earlier outputs can recur and drift through later
 ones. Existing SQLite histories migrate automatically and retain their old traces.
 
-`/forget` clears that history, intensity and translation preference. `/status`
-shows memory and translation/OCR availability. `/help` explains the commands.
+The optional `/forget` command clears that history, intensity and translation
+preference, with a brief acknowledgement. It is not advertised in a bot menu.
 Storage is SQLite at `data/artifacts.sqlite3` (override `MEMORY_DB`). Place it on
 a persistent volume to retain memory across deploys. Render's free ephemeral
 filesystem loses memory on restart/redeploy; a paid disk is **not** provisioned
@@ -90,12 +94,13 @@ Set `TRANSLATE_URL` to the root URL of a LibreTranslate-compatible service, e.g.
 silently selected. You can self-host LibreTranslate; see
 <https://docs.libretranslate.com/guides/installation/>.
 
-Then send `/translate on` to the bot. This opts that sender/chat into sending
+The optional `/translate on` command opts that sender/chat into sending
 selected snippets to the configured provider; images are OCR'd locally and only
 recognized text is sent, never the image itself. `/translate off` stops this.
-Translation is off by default. Without a service, memory effects still work and
-the command explains the missing configuration. Group members cannot enable
-translation for each other's uploads.
+Translation is off by default; automatic processing does not enable it or change
+an existing opt-in. Without a service, memory effects still work. These controls
+are not advertised in a bot menu. Group members cannot enable translation for
+each other's uploads.
 
 Each eligible upload selects a few phrases/lines and random target languages.
 Text regions in images are painted over with translated text, fitted into their
@@ -163,7 +168,8 @@ media/PDF integration tests; CI installs them alongside OCR.
 Tests cover memory isolation/expiry/bounds/restarts and schema migration, original
 and transformed traces, every mathematical image/audio variation, Unicode text,
 reopened DOCX/PDF/WAV files, MP4 video and audio decoding, resource limits, the
-destructive fallback, voice-message routing, failed delivery, translation HTTP
+destructive fallback, automatic intensity and routing, silent file replies,
+command-menu cleanup, failed delivery, translation HTTP
 requests/failures, and real local OCR when Tesseract is installed. Fixtures are
 generated locally; tests use a local fake translation server and no real Telegram
 account or third-party user content. Provider
