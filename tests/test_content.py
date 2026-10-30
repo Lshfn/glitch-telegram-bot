@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import closing
 import os
 import random
 import shutil
@@ -166,7 +167,7 @@ class MigrationTests(unittest.TestCase):
     def test_old_database_upgrades_and_preferences_do_not_reset_each_other(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "old.sqlite3"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db:
                 db.executescript("""
                     CREATE TABLE artifacts (chat TEXT,digest TEXT,touched REAL,level INTEGER,
                         image BLOB,text TEXT,sample BLOB,PRIMARY KEY(chat,digest));
@@ -174,6 +175,7 @@ class MigrationTests(unittest.TestCase):
                 """)
                 import time
                 db.execute("INSERT INTO artifacts VALUES (?,?,?,1,?,?,?)", ("a", "x", time.time(), b"", '["old words"]', b"old"))
+                db.commit()
             memory = ArtifactMemory(path)
             self.assertEqual(memory.snapshot("a", "x")[1][0].text, ("old words",))
             memory.translations("a", True)
@@ -228,7 +230,9 @@ class FormatTests(unittest.IsolatedAsyncioTestCase):
             path.write_bytes(result)
             info = subprocess.check_output(["pdfinfo", str(path)]).decode()
             self.assertRegex(info, r"Pages:\s+2")
-        self.assertTrue(any("Original" in text or "voices" in text for text in artifact.text))
+        self.assertTrue(artifact.text)
+        source_words = {"Original", "paper", "voices", "page", "1", "2"}
+        self.assertTrue(all(set(snippet.split()) <= source_words for snippet in artifact.text))
         self.assertTrue(artifact.image)
         self.assertIn("flattened", " ".join(notices))
 
@@ -259,16 +263,19 @@ class FormatTests(unittest.IsolatedAsyncioTestCase):
                             "testsrc2=size=96x64:rate=8", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=22050",
                             "-t", "1", "-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p",
                             "-c:a", "aac", str(source)], check=True)
-            result, recipe, artifact, notices, name = await engine.process_upload(
-                source.read_bytes(), "clip.mp4", 7, [trace(text="Video haunted by document words.")])
-            self.assertEqual(name, "clip.mp4")
-            self.assertIn("temporal feedback", recipe)
-            output = Path(root) / "result.mp4"
-            output.write_bytes(result)
-            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(output),
-                            "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"], check=True)
-            self.assertTrue(artifact.image)
-            self.assertTrue(artifact.signal)
+            for seed in (7, 42, 123):
+                with self.subTest(seed=seed):
+                    random.seed(seed)
+                    result, recipe, artifact, notices, name = await engine.process_upload(
+                        source.read_bytes(), "clip.mp4", 12, [trace(text="Video haunted by document words.")])
+                    self.assertEqual(name, "clip.mp4")
+                    self.assertIn("temporal feedback", recipe)
+                    output = Path(root) / "result.mp4"
+                    output.write_bytes(result)
+                    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(output),
+                                    "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"], check=True)
+                    self.assertTrue(artifact.image)
+                    self.assertTrue(artifact.signal)
 
     async def test_raw_mode_preserves_existing_byte_effects_without_decoder_calls(self):
         data = docx_bytes()
