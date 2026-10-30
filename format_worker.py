@@ -10,14 +10,14 @@ def main():
     # Set limits before loading NumPy, XML/image libraries, or any uploaded data.
     import resource
     # FFmpeg's shared libraries also count toward virtual address space.
-    resource.setrlimit(resource.RLIMIT_AS, (768 * 1024 * 1024,) * 2)
+    resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024,) * 2)
     resource.setrlimit(resource.RLIMIT_CPU, (45, 45))
     resource.setrlimit(resource.RLIMIT_FSIZE, (96 * 1024 * 1024,) * 2)
     resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
     try:
         from io import BytesIO
         from PIL import Image
-        from file_formats import (ContentLimitError, MAX_OUTPUT, pack_artifact,
+        from file_formats import (ContentLimitError, ContentUnavailable, MAX_OUTPUT, pack_artifact,
                                   process_content, unpack_artifact)
         import glitch_bot
         config = json.loads((root / "job.json").read_text(encoding="utf-8"))
@@ -38,12 +38,12 @@ def main():
         metadata = {"recipe": recipe, "artifact": pack_artifact(artifact),
                     "notices": notices, "extension": extension}
     except Exception as exc:
-        from file_formats import ContentLimitError
+        from file_formats import ContentLimitError, ContentUnavailable
         is_limit = isinstance(exc, (ContentLimitError, MemoryError))
-        message = (str(exc) if isinstance(exc, ContentLimitError) else
+        message = (str(exc) if isinstance(exc, (ContentLimitError, ContentUnavailable)) else
                    "Content processing exceeded its memory budget. Try a smaller file."
                    if isinstance(exc, MemoryError) else
-                   "The file could not be decoded within the local processing setup.")
+                   f"Content processing failed ({type(exc).__name__}).")
         metadata = {"error": "limit" if is_limit else "decode", "message": message}
     (root / "result.json").write_text(json.dumps(metadata), encoding="utf-8")
 

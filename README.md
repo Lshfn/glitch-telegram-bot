@@ -132,7 +132,8 @@ images to 12 megapixels and processing resolution to 1600 px on the longest edge
 Heavy processing runs off the event loop; at most two uploads run concurrently,
 with ordered processing within each sender/chat history. Only one document/media
 worker runs at a time. Workers have a 60-second wall deadline, a 45-second CPU
-budget and a 768 MB address-space limit; their decoder subprocesses inherit the
+budget and a 1 GB virtual address-space limit (including decoder libraries);
+their decoder subprocesses inherit the
 limits and are killed with the worker on timeout. Use Docker on other platforms.
 
 Content-mode limits are 12 PDF pages, 60 seconds of audio, 12 seconds of video,
