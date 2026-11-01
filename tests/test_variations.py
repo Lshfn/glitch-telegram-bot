@@ -9,13 +9,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageOps
 
 from artifact_memory import Artifact, ArtifactMemory
 from content_fusion import merge_traces, trace
 from file_formats import codec_datamosh, pack_artifact, unpack_artifact
 from image_agents import agent_canvas
 from memory_effects import inherit_image
+from image_surfaces import content_mask, multiscale_blend
 from video_mosh import motion_feedback, remove_intra_frames
 
 _temp = tempfile.TemporaryDirectory()
@@ -66,13 +67,14 @@ class ImageVariationTests(unittest.TestCase):
     def test_memory_styles_and_agents_handle_tiny_and_rectangular_images(self):
         donor = Artifact(image=encoded(Image.new("RGB", (31, 9), "orange")), text=("remembered words",))
         for size in ((1, 1), (7, 11), (120, 80)):
-            for style in ("fragment", "window", "ghost", "contour", "difference", "channel", "splice", "recursive"):
+            for style in ("fragment", "window", "ghost", "contour", "difference", "channel", "splice", "recursive",
+                          "palimpsest", "texture graft", "ghost field", "channel haunt", "recursive field"):
                 result, _ = inherit_image(Image.new("RGB", size), [donor], .9, style=style)
                 self.assertEqual(result.size, size)
                 self.assertEqual(result.mode, "RGB")
             result, labels = agent_canvas(Image.new("RGB", size, "navy"), Image.new("RGB", size, "red"), [donor], 12)
             self.assertEqual(result.size, size)
-            self.assertIn("protected island", labels)
+            self.assertIn("protected detail", labels)
 
     def test_agents_change_local_regions_and_react_to_donor_content(self):
         source = Image.new("RGB", (240, 160), "#304050")
@@ -89,18 +91,69 @@ class ImageVariationTests(unittest.TestCase):
             results.append(result.tobytes())
         self.assertNotEqual(*results)
 
-    def test_recipes_do_not_stack_strip_effects_and_keep_other_effects_available(self):
+    def test_automatic_recipes_exclude_strips_and_rectangular_cuts(self):
         random.seed(77)
-        seen, striped = set(), 0
+        seen = set()
         for _ in range(600):
             names, strength = engine.make_glitch_recipe(12)
             seen.update(names)
-            strips = [name for name in names if name in engine.STRIP_EFFECTS]
-            self.assertLessEqual(len(strips), 1)
-            striped += bool(strips)
+            self.assertFalse(set(names) & (engine.STRIP_EFFECTS | {"block displacement", "channel blocks", "noise clusters"}))
             self.assertTrue(0 < strength <= 1)
-        self.assertLess(striped, 300)
-        self.assertTrue(set(engine.EFFECTS) <= seen)
+        self.assertEqual(set(engine.AUTOMATIC_EFFECTS), seen)
+        self.assertTrue(engine.STRIP_EFFECTS <= set(engine.EFFECTS))
+
+    def test_region_selection_changes_with_image_structure(self):
+        source = Image.new("RGB", (144, 96), "#304050")
+        ImageDraw.Draw(source).polygon([(10, 0), (95, 0), (118, 20), (72, 48), (110, 96),
+                                      (30, 96), (42, 66), (8, 43)], fill="#dca35a")
+        masks = []
+        for image in (source, ImageOps.mirror(source)):
+            random.seed(43)
+            mask = content_mask(image, coverage=.3)
+            pixels = np.asarray(mask)
+            self.assertGreater(float(pixels.mean()), 5)
+            self.assertLess(float(pixels.mean()), 120)
+            self.assertTrue(np.any((pixels > 0) & (pixels < 255)))
+            masks.append(pixels)
+        self.assertFalse(np.array_equal(*masks))
+
+    def test_automatic_memory_does_not_reintroduce_old_processed_cutouts(self):
+        artifact = Artifact(image=encoded(Image.new("RGB", (80, 60), "magenta")),
+                            original_image=encoded(Image.new("RGB", (80, 60), "cyan")))
+        for seed in range(20):
+            random.seed(seed)
+            result, labels = inherit_image(Image.new("RGB", (120, 80)), [artifact], .8)
+            self.assertNotIn("inherited recursive field", labels)
+            self.assertEqual(int(np.asarray(result)[:, :, 0].max()), 0)
+
+    def test_multiscale_memory_changes_region_and_keeps_untouched_pixels(self):
+        base = Image.new("RGB", (160, 96), "#304050")
+        donor = Image.new("RGB", base.size, "#daaa77")
+        ImageDraw.Draw(donor).text((20, 40), "EARLIER FILE", fill="black")
+        random.seed(8)
+        mask = content_mask(base, donor, .35)
+        result = multiscale_blend(base, donor, mask)
+        before, after = np.asarray(base), np.asarray(result)
+        untouched = np.asarray(mask) <= 1
+        self.assertTrue(untouched.any())
+        self.assertTrue(np.array_equal(before[untouched], after[untouched]))
+        self.assertGreater(float(np.abs(before.astype(float) - after).mean()), 1)
+
+    def test_automatic_images_never_draw_ellipses_or_use_jpeg_byte_corruption(self):
+        source = Image.new("RGB", (120, 80), "#304050")
+        ImageDraw.Draw(source).text((10, 20), "CURRENT", fill="white")
+        donor = Artifact(image=encoded(ImageOps.invert(source)), text=("earlier file",))
+        with patch("PIL.ImageDraw.ImageDraw.ellipse", side_effect=AssertionError("geometric cutout")), patch.object(
+                engine, "jpeg_databend", side_effect=AssertionError("JPEG byte corruption")):
+            for seed in range(24):
+                random.seed(seed)
+                result, recipe = engine.glitch_image(b"", 1 + seed % 12,
+                                                      "JPEG" if seed % 2 else "PNG", [donor], source)
+                Image.open(BytesIO(result)).load()
+                self.assertFalse(set(recipe) & engine.STRIP_EFFECTS)
+                self.assertNotIn("modular lattice", recipe)
+                self.assertNotIn("spectral crossover", recipe)
+                self.assertNotIn("agent pixel trail", recipe)
 
 
 class DatamoshTests(unittest.TestCase):

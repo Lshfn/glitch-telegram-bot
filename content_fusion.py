@@ -10,10 +10,12 @@ import numpy as np
 from PIL import Image
 
 from artifact_memory import Artifact, extract_artifact
+from image_surfaces import content_mask
 
 TRACE_SIZE = 2048
 IMAGE_METHODS = ("spectral crossover", "content displacement", "reaction diffusion",
                  "bitplane weave", "modular lattice")
+AUTOMATIC_IMAGE_METHODS = ("content displacement", "reaction diffusion", "bitplane weave")
 AUDIO_METHODS = ("spectral vocoder", "content convolution", "granular permutation",
                  "phase modulation", "wavefold", "sample bitplanes")
 
@@ -112,9 +114,9 @@ def fuse_image(image, source, artifacts, intensity, methods=None):
     strength = .10 + level * .045
     chosen = list(methods) if methods is not None else []
     if methods is None and random.random() < .65:
-        pool = list(IMAGE_METHODS)
+        pool = list(AUTOMATIC_IMAGE_METHODS)
         for _ in range(1 + int(level >= 8 and random.random() < .25)):
-            method = random.choices(pool, [dict(zip(IMAGE_METHODS, (1, .6, .8, .8, .08)))[m] for m in pool])[0]
+            method = random.choice(pool)
             chosen.append(method)
             pool.remove(method)
     if not chosen:
@@ -143,7 +145,7 @@ def fuse_image(image, source, artifacts, intensity, methods=None):
         elif method == "content displacement":
             dx = (field * w * .055 * strength).astype(np.int32)
             dy = (np.roll(field, max(1, h // 3), axis=0) * h * .045 * strength).astype(np.int32)
-            array = array[(yy + dy) % h, (xx + dx) % w]
+            array = array[np.clip(yy + dy, 0, h - 1), np.clip(xx + dx, 0, w - 1)]
         elif method == "reaction diffusion":
             # Gray-Scott chemicals start from the image and the donor field.
             sw, sh = min(160, w), min(160, h)
@@ -177,18 +179,7 @@ def fuse_image(image, source, artifacts, intensity, methods=None):
     result = Image.fromarray((array * 255).astype("uint8"))
     result = result.resize(image.size, Image.Resampling.BICUBIC)
     if methods is None:
-        # Most numerical interventions occupy a soft, local area; rare ones spread.
-        from PIL import ImageDraw, ImageFilter
-        mask = Image.new("L", image.size)
-        draw = ImageDraw.Draw(mask)
-        for _ in range(random.randint(1, 3)):
-            rw = random.randint(max(1, image.width // 6), max(1, image.width * 3 // 4))
-            rh = random.randint(max(1, image.height // 6), max(1, image.height * 3 // 4))
-            x, y = random.randrange(image.width), random.randrange(image.height)
-            draw.ellipse((x - rw // 2, y - rh // 2, x + rw // 2 + 1, y + rh // 2 + 1), fill=255)
-        if random.random() < .08:
-            mask = Image.new("L", image.size, 180)
-        mask = mask.filter(ImageFilter.GaussianBlur(max(1, min(image.size) * .025)))
+        mask = content_mask(image, result, random.uniform(.12, .4))
         result = Image.composite(result, image, mask)
     return result, chosen
 

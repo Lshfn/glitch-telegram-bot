@@ -7,11 +7,12 @@ import math
 import random
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 from memory_effects import visual_donors
+from image_surfaces import content_mask, detail_mask
 
-TOOLS = ("smudge", "sharpen", "restore", "sampler", "prism", "pixel trail", "contour ink")
+TOOLS = ("smudge", "sharpen", "restore", "sampler", "prism", "texture bleed", "contour ink")
 
 
 def agent_canvas(image, original, artifacts, intensity, rounds=None):
@@ -22,14 +23,11 @@ def agent_canvas(image, original, artifacts, intensity, rounds=None):
     original = original.resize(canvas.size, Image.Resampling.LANCZOS)
     donors = visual_donors(artifacts) or [original]
     # One selected island resists all tools, including the sampler.
-    protected = Image.new("L", canvas.size)
-    radius = max(1, int(min(canvas.size) * random.uniform(.06, .16)))
-    px, py = random.randrange(canvas.width), random.randrange(canvas.height)
-    ImageDraw.Draw(protected).ellipse((px - radius, py - radius, px + radius, py + radius), fill=255)
+    protected = content_mask(canvas, coverage=random.uniform(.04, .12))
     agents = [{"x": random.randrange(canvas.width), "y": random.randrange(canvas.height),
                "tool": random.choice(TOOLS), "radius": random.uniform(.025, .10)}
               for _ in range(random.randint(2, 4))]
-    labels = ["editing agents", "protected island"]
+    labels = ["editing agents", "protected detail"]
     for _ in range(rounds if rounds is not None else 3 + level // 2):
         random.shuffle(agents)
         # Heatmaps are recomputed from the canvas as it changes.
@@ -75,15 +73,9 @@ def agent_canvas(image, original, artifacts, intensity, rounds=None):
                 ink = ImageOps.invert(contours.point(lambda p: 255 if p > 30 else 0)).convert("RGB")
                 changed = Image.blend(patch, ink, .72)
             else:
-                pixels = np.asarray(patch).copy()
-                order = np.argsort(pixels.sum(axis=2), axis=0, kind="stable")
-                changed = Image.fromarray(np.take_along_axis(pixels, order[:, :, None], axis=0))
-            mask = Image.new("L", patch.size)
-            points = [(agent["x"] - box[0], agent["y"] - box[1]), (x - box[0], y - box[1])]
-            draw = ImageDraw.Draw(mask)
-            draw.line(points, fill=230, width=max(1, r * 2))
-            for cx, cy in points:
-                draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=230)
+                changed = Image.blend(patch.filter(ImageFilter.GaussianBlur(max(.5, r / 5))),
+                                      patch.filter(ImageFilter.DETAIL), .65)
+            mask = detail_mask(patch, changed, .6)
             mask = ImageChops.subtract(mask, protected.crop(box))
             canvas.paste(changed, box[:2], mask)
             agent["x"], agent["y"] = x, y
