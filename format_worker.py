@@ -18,15 +18,24 @@ def main():
         from io import BytesIO
         from PIL import Image
         from file_formats import (ContentLimitError, ContentUnavailable, MAX_OUTPUT, pack_artifact,
-                                  process_content, unpack_artifact)
+                                  process_content, unpack_artifact, VIDEO_EXTENSIONS)
         import glitch_bot
         config = json.loads((root / "job.json").read_text(encoding="utf-8"))
         random.seed(config["seed"])
         extension, level = config["extension"], config["level"]
         artifacts = [unpack_artifact(a) for a in config["artifacts"]]
+        render_seed = random.getrandbits(64)
 
         def render(image, source):
-            data, recipe = glitch_bot.glitch_image(b"", level, "PNG", artifacts, image, source)
+            state = random.getstate()
+            if extension in VIDEO_EXTENSIONS:
+                # A clip keeps one visual grammar; temporal effects create bursts.
+                random.seed(render_seed)
+            try:
+                data, recipe = glitch_bot.glitch_image(b"", level, "PNG", artifacts, image, source)
+            finally:
+                if extension in VIDEO_EXTENSIONS:
+                    random.setstate(state)
             with Image.open(BytesIO(data)) as decoded:
                 return decoded.convert("RGB"), recipe
 

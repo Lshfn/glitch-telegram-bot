@@ -22,6 +22,7 @@ from artifact_memory import Artifact, open_image
 from content_fusion import donor_signal, fuse_audio, fuse_text, merge_traces, trace
 from language_glitch import font
 from memory_effects import glitch_text
+from video_mosh import motion_feedback, remove_intra_frames, frame_types
 
 DOCUMENT_EXTENSIONS = (".docx", ".pdf")
 AUDIO_EXTENSIONS = (".wav", ".mp3", ".ogg", ".oga", ".flac", ".m4a", ".aac", ".opus", ".aiff", ".aif")
@@ -46,12 +47,14 @@ class ContentUnavailable(RuntimeError):
 def pack_artifact(artifact):
     return {"image": base64.b64encode(artifact.image).decode(), "text": list(artifact.text),
             "sample": base64.b64encode(artifact.sample).decode(),
-            "signal": base64.b64encode(artifact.signal).decode()}
+            "signal": base64.b64encode(artifact.signal).decode(),
+            "original_image": base64.b64encode(artifact.original_image).decode()}
 
 
 def unpack_artifact(value):
     return Artifact(base64.b64decode(value["image"]), tuple(value["text"]),
-                    base64.b64decode(value["sample"]), base64.b64decode(value.get("signal", "")))
+                    base64.b64decode(value["sample"]), base64.b64decode(value.get("signal", "")),
+                    base64.b64decode(value.get("original_image", "")))
 
 
 def run_content_job(data, extension, level, artifacts):
@@ -281,6 +284,46 @@ def waveform_image(samples):
     return image
 
 
+def codec_datamosh(frames_dir, root, count):
+    """Remove actual intra frames in a temporary predictive stream, then decode."""
+    source, bent = root / "prediction.m4v", root / "moshed.m4v"
+    command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-cpucount", "1",
+               "-filter_threads", "1", "-threads", "1", "-framerate", str(VIDEO_FPS),
+               "-i", str(frames_dir / "%04d.png"), "-an", "-c:v", "mpeg4", "-bf", "0",
+               "-g", "4", "-sc_threshold", "0", "-q:v", "4", "-pix_fmt", "yuv420p",
+               "-threads", "1", "-f", "m4v", str(source)]
+    run_tool(command, stage="datamosh prediction encode")
+    encoded = source.read_bytes()
+    types = frame_types(encoded)
+    payload, removed = remove_intra_frames(encoded)
+    if not removed:
+        return frames_dir, False
+    bent.write_bytes(payload)
+    missing = {i for i, kind in enumerate(types) if i > 0 and kind == "I"}
+    if len(types) != count or len(missing) != removed:
+        raise ContentUnavailable("Unexpected predictive stream frame structure.")
+    decoded, target = root / "mosh_decoded", root / "moshed_frames"
+    decoded.mkdir()
+    target.mkdir()
+    run_tool(["ffmpeg", "-nostdin", "-v", "error", "-y", "-cpucount", "1",
+              "-filter_threads", "1", "-threads", "1", "-err_detect", "ignore_err",
+              "-f", "m4v", "-i", str(bent), "-an", "-fps_mode", "passthrough",
+              "-frames:v", str(count), "-threads", "1", str(decoded / "%04d.png")],
+             stage="datamosh decode")
+    frames = sorted(decoded.glob("*.png"))
+    if len(frames) != count - removed:
+        raise ContentUnavailable("Datamosh decoder lost unexpected predictive frames.")
+    # Restore removed time slots exactly where they were, preserving audio sync.
+    # This avoids squeezing the motion into a shorter clip and padding the tail.
+    cursor, last = 0, frames[0]
+    for i in range(count):
+        if i not in missing:
+            last = frames[cursor]
+            cursor += 1
+        shutil.copyfile(last, target / f"{i + 1:04d}.png")
+    return target, True
+
+
 def media_content(path, extension, level, artifacts, render):
     root = path.parent
     probe = media_probe(path)
@@ -328,34 +371,53 @@ def media_content(path, extension, level, artifacts, render):
     field = donor_signal(source, artifacts, len(frames))
     order = list(range(len(frames)))
     labels = ["temporal feedback"]
-    if level >= 4 and len(frames) > 2:
+    if level >= 4 and len(frames) > 2 and random.random() < .2:
         # Permute inside temporal neighbourhoods, retaining the overall duration.
-        width = min(len(frames), 2 + level)
+        width = min(len(frames), random.randint(2, 4))
         for i in range(0, len(frames), width):
             order[i:i + width] = [i + int(j) for j in np.argsort(field[i:i + width], kind="stable")]
         labels.append("content time permutation")
     ghosts, previews = [], []
-    style = random.choice(("blend", "scan", "difference"))
+    style = random.choices(("melt", "bloom", "blend", "difference", "scan", "quiet"),
+                           (3, 2, 1.5, .4, .12, 1))[0]
+    burst = random.randint(3, 10)
+    previous = None
     for i, index in enumerate(order):
-        image, effects = render(open_image(frames[index].read_bytes()), source)
+        current = open_image(frames[index].read_bytes())
+        image, effects = render(current, source)
         labels.extend(effects)
         if ghosts:
             donor = random.choice(ghosts)
-            if style == "blend":
-                image = Image.blend(image, donor, .12 + level * .025)
+            if style in ("melt", "bloom") and i % burst:
+                image = motion_feedback(image, previous, current, ghosts[-1], level / 12, style)
+                labels.append("motion datamosh " + style)
+            elif style == "blend":
+                image = Image.blend(image, donor, random.uniform(.08, .3))
             elif style == "difference":
-                image = Image.blend(image, ImageChops.difference(image, donor), .2 + level * .03)
-            else:
+                image = Image.blend(image, ImageChops.difference(image, donor), .1 + level * .015)
+            elif style == "scan":
                 row = int(abs(field[i]) * max(0, image.height - 1))
-                end = min(image.height, row + max(1, image.height // (15 - level)))
+                end = min(image.height, row + max(1, image.height // 50))
                 image.paste(donor.crop((0, row, image.width, end)), (0, row))
+        previous = current
         ghosts.append(image.copy())
         ghosts = ghosts[-3:]
         if i % max(1, len(frames) // 12) == 0:
             previews.append(image.resize((160, 160)))
         image.save(fused_dir / f"{i + 1:04d}.png")
+    encode_dir = fused_dir
+    if len(frames) > 4 and random.random() < .45:
+        try:
+            encode_dir, used = codec_datamosh(fused_dir, root, len(frames))
+            if used:
+                labels.append("codec I-frame removal")
+                previews = [open_image(p.read_bytes()) for p in sorted(encode_dir.glob("*.png"))[::max(1, len(frames) // 12)]]
+        except ContentUnavailable:
+            # The bounded decoded-frame route is still usable on decoder failure.
+            encode_dir = fused_dir
+            labels.append("codec mosh unavailable; temporal effects retained")
     command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-cpucount", "1", "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "1",
-               "-framerate", str(VIDEO_FPS), "-i", str(fused_dir / "%04d.png")]
+               "-framerate", str(VIDEO_FPS), "-i", str(encode_dir / "%04d.png")]
     audio_output = None
     if samples is not None:
         audio_output, audio_effects = fuse_audio(samples, source, artifacts, level)

@@ -7,7 +7,7 @@ import random
 from io import BytesIO
 
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image
 
 from artifact_memory import Artifact, extract_artifact
 
@@ -87,20 +87,11 @@ def trace(data=b"", text="", image=None, waveform=None):
 def merge_traces(original, rendered):
     """Carry both original and transformed material, within the existing bounds."""
     image = rendered.image or original.image
-    if original.image and rendered.image:
-        with Image.open(BytesIO(original.image)) as a, Image.open(BytesIO(rendered.image)) as b:
-            tile = ImageOps.fit(a.convert("RGB"), (160, 160))
-            other = ImageOps.fit(b.convert("RGB"), (160, 160))
-            sheet = Image.new("RGB", (320, 160))
-            sheet.paste(tile, (0, 0))
-            sheet.paste(other, (160, 0))
-            buf = BytesIO()
-            sheet.save(buf, "JPEG", quality=70)
-            image = buf.getvalue()
     words = tuple(dict.fromkeys(original.text[:3] + rendered.text[:2]))[:5]
     payload = original.sample[:2048] + rendered.sample[:2048]
     return Artifact(image, words, payload,
-                    project(np.concatenate((signal_of(original), signal_of(rendered)))))
+                    project(np.concatenate((signal_of(original), signal_of(rendered)))),
+                    original.original_image or original.image)
 
 
 def donor_signal(source, artifacts, size):
@@ -118,14 +109,23 @@ def donor_signal(source, artifacts, size):
 
 def fuse_image(image, source, artifacts, intensity, methods=None):
     level = min(12, max(1, int(intensity)))
-    strength = .18 + level * .065
-    chosen = list(methods) if methods is not None else random.sample(
-        IMAGE_METHODS, random.randint(1, 1 + level // 4))
+    strength = .10 + level * .045
+    chosen = list(methods) if methods is not None else []
+    if methods is None and random.random() < .65:
+        pool = list(IMAGE_METHODS)
+        for _ in range(1 + int(level >= 8 and random.random() < .25)):
+            method = random.choices(pool, [dict(zip(IMAGE_METHODS, (1, .6, .8, .8, .08)))[m] for m in pool])[0]
+            chosen.append(method)
+            pool.remove(method)
+    if not chosen:
+        return image.copy(), []
     working = image.convert("RGB").copy()
     working.thumbnail((768, 768))
     array = np.asarray(working, dtype=np.float32) / 255
     h, w = array.shape[:2]
-    field = donor_signal(source, artifacts, h * w).reshape(h, w)
+    # A small 2D field avoids interpreting linear byte/sample boundaries as rows.
+    coarse = donor_signal(source, artifacts, 23 * 23).reshape(23, 23)
+    field = np.asarray(Image.fromarray(coarse).resize((w, h), Image.Resampling.BICUBIC)).copy()
     yy, xx = np.indices((h, w))
     for method in chosen:
         if method == "spectral crossover":
@@ -141,8 +141,8 @@ def fuse_image(image, source, artifacts, intensity, methods=None):
                 crossed[0, 0] = current[0, 0]
                 array[:, :, c] = np.fft.irfft2(crossed, s=(h, w)).real
         elif method == "content displacement":
-            dx = (field * w * .22 * strength).astype(np.int32)
-            dy = (np.roll(field, max(1, h // 3), axis=0) * h * .15 * strength).astype(np.int32)
+            dx = (field * w * .055 * strength).astype(np.int32)
+            dy = (np.roll(field, max(1, h // 3), axis=0) * h * .045 * strength).astype(np.int32)
             array = array[(yy + dy) % h, (xx + dx) % w]
         elif method == "reaction diffusion":
             # Gray-Scott chemicals start from the image and the donor field.
@@ -163,7 +163,7 @@ def fuse_image(image, source, artifacts, intensity, methods=None):
                 (mask, np.roll(mask, w // 8, 1), 1 - mask), axis=2) * strength * .45
         elif method == "bitplane weave":
             pixels = (np.clip(array, 0, 1) * 255).astype("uint8")
-            bits = min(7, 1 + level // 2)
+            bits = min(5, 1 + level // 3)
             mask = (1 << bits) - 1
             woven = ((field + 1) * 127.5).astype("uint8")
             array = ((pixels & (255 ^ mask)) | (woven[:, :, None] & mask)).astype(np.float32) / 255
@@ -175,7 +175,22 @@ def fuse_image(image, source, artifacts, intensity, methods=None):
             raise ValueError("Unknown image fusion method")
         array = np.clip(np.nan_to_num(array), 0, 1)
     result = Image.fromarray((array * 255).astype("uint8"))
-    return result.resize(image.size, Image.Resampling.NEAREST), chosen
+    result = result.resize(image.size, Image.Resampling.BICUBIC)
+    if methods is None:
+        # Most numerical interventions occupy a soft, local area; rare ones spread.
+        from PIL import ImageDraw, ImageFilter
+        mask = Image.new("L", image.size)
+        draw = ImageDraw.Draw(mask)
+        for _ in range(random.randint(1, 3)):
+            rw = random.randint(max(1, image.width // 6), max(1, image.width * 3 // 4))
+            rh = random.randint(max(1, image.height // 6), max(1, image.height * 3 // 4))
+            x, y = random.randrange(image.width), random.randrange(image.height)
+            draw.ellipse((x - rw // 2, y - rh // 2, x + rw // 2 + 1, y + rh // 2 + 1), fill=255)
+        if random.random() < .08:
+            mask = Image.new("L", image.size, 180)
+        mask = mask.filter(ImageFilter.GaussianBlur(max(1, min(image.size) * .025)))
+        result = Image.composite(result, image, mask)
+    return result, chosen
 
 
 def fuse_audio(samples, source, artifacts, intensity, methods=None):
