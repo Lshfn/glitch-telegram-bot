@@ -3,8 +3,13 @@ import random
 from io import BytesIO
 
 from PIL import Image, ImageChops, ImageDraw, ImageOps, ImageFilter
+import numpy as np
 
 from language_glitch import font
+from image_surfaces import content_mask, detail_mask, multiscale_blend
+
+MEMORY_SURFACES = ("palimpsest", "texture graft", "ghost field", "channel haunt", "recursive field")
+AUTOMATIC_MEMORY_SURFACES = MEMORY_SURFACES[:-1]
 
 
 def visual_donors(artifacts, prefer_original=True):
@@ -31,12 +36,28 @@ def inherit_image(image, artifacts, strength, style=None):
                 break
     labels = []
     if sources:
-        style = style or random.choices(
-            ("fragment", "window", "ghost", "contour", "difference", "channel", "splice", "recursive"),
-            (5, 3, 2, 1.5, .25, .4, .12, .65))[0]
-        if style == "recursive":
+        style = style or random.choices(AUTOMATIC_MEMORY_SURFACES, (4, 3, 2, 1))[0]
+        if style in ("recursive", "recursive field"):
             sources = visual_donors(artifacts, prefer_original=False) or sources
-        for _ in range(random.randint(1, 2 + int(strength > .65))):
+        if style in MEMORY_SURFACES:
+            donor = ImageOps.fit(random.choice(sources), out.size, Image.Resampling.LANCZOS)
+            if style == "texture graft":
+                radius = max(1, min(out.size) * .035)
+                color = np.asarray(out.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32)
+                donor_color = np.asarray(donor.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32)
+                pixels = np.asarray(donor, dtype=np.float32) + (color - donor_color) * .8
+                donor = Image.fromarray(np.clip(pixels, 0, 255).astype("uint8"))
+            elif style == "channel haunt":
+                channels = list(out.split())
+                donor_channels = donor.split()
+                changed = [c for c in range(3) if ImageChops.difference(channels[c], donor_channels[c]).getbbox()]
+                c = random.choice(changed or list(range(3)))
+                channels[c] = donor_channels[c]
+                donor = Image.merge("RGB", channels)
+            mask = content_mask(out, donor, random.uniform(.22, .52))
+            opacity = random.uniform(.35, .6) if style == "ghost field" else random.uniform(.65, .95)
+            out = multiscale_blend(out, donor, mask, opacity)
+        for _ in range(0 if style in MEMORY_SURFACES else random.randint(1, 2 + int(strength > .65))):
             donor = random.choice(sources)
             # Crop a substantial region, then resize at one scale on both axes.
             fraction = 1.0 if style == "window" else random.uniform(.6, 1)
@@ -64,9 +85,8 @@ def inherit_image(image, artifacts, strength, style=None):
                 channels = list(base.split())
                 channels[random.randrange(3)] = random.choice(crop.split())
                 crop = Image.merge("RGB", channels)
-            elif style == "fragment" and random.random() < .45:
-                mask = Image.new("L", (tw, th))
-                ImageDraw.Draw(mask).ellipse((0, 0, tw, th), fill=255)
+            elif style == "fragment":
+                mask = detail_mask(base, crop, .65)
             out.paste(crop, (x, y), mask)
         labels.append("inherited " + style)
     snippets = [t for a in artifacts for t in a.text]

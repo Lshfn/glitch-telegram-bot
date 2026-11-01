@@ -8,7 +8,7 @@ images break apart, fragments of earlier uploads return, and words slip into oth
 
 ## How it works
 
-The bot makes images inherit recognisable crops, windows, ghost layers, contours
+The bot makes images inherit surface detail, ghost layers, contours
 and snippets from previous uploads. Documents, sound and moving images now take
 part in the same memory. A paragraph can become a displacement field for an
 image; an audio waveform can become a document's word-order pattern; video frames
@@ -22,18 +22,30 @@ from 1 to 12, with quieter and medium-strength recipes more frequent. Repeated
 content gently biases the draw towards stronger effects, without locking later
 uploads at maximum intensity. A violent render can be followed by a quiet one.
 
-Image recipes no longer stack multiple strip effects. Strip weights, width and
-counts are reduced, and numerical transformations normally affect soft local
-regions. Memory is applied last, with substantial crops resized at one scale on
-both axes. Original thumbnails supply most recognisable fragments; occasional
-recursive memories use the earlier output instead. Earlier documents can return
-as readable phrases and page fragments, and earlier audio as projected signals.
+Automatic image processing excludes strip effects, hard rectangular cuts,
+rectangular noise clusters, JPEG byte corruption, spectral crossover and modular
+lattice scrambling. Those earlier
+effects remain in the engine for internal use. The automatic variations work
+through regions grown from the pictures' color, edges and texture, including
+erosion that spreads neighbouring light and dark detail across the surface.
+
+Memory enters through multiscale blending, with palimpsest, texture graft, ghost
+field and channel variations. Donor proportions are retained when
+fitting the image; the revealed area follows the current and remembered images.
+Texture grafts adapt the remembered image's low-frequency color to the current
+picture. Automatic memory prefers the original thumbnails so old cutout effects
+do not recirculate from an entry's processed thumbnail. Processed traces continue
+to drive mathematical fusion. Mathematical effects and editing agents use
+image-guided regions too.
+There are no generated circular apertures or default sticker/window crops.
+Earlier documents can return as readable phrases and page material, and earlier
+audio as projected signals.
 
 Some images use small autonomous editing agents inspired by
 [RRR's 0..1](https://rulesrulesrules.studio/art/0-1). They read changing edge and
 brightness maps, move locally and interact through smudging, sharpening,
-restoration, sampling older material, prism shifts, pixel trails and contour ink.
-Protected islands resist their edits. Local pixel values can change an agent's
+restoration, sampling older material, prism shifts, texture bleed and contour ink.
+Selected image details resist their edits. Local pixel values can change an agent's
 next tool and brush radius. This is a bounded adaptation of the tool-interaction
 idea; the reference images and implementation are not copied into the bot.
 
@@ -198,7 +210,8 @@ reopened DOCX/PDF/WAV files, MP4 video and audio decoding, resource limits, the
 destructive fallback, automatic intensity and routing, silent file replies,
 command-menu cleanup, failed delivery, translation HTTP
 requests/failures, recognisable memory proportions, intact/processed thumbnail
-migration, local editing agents, non-stacking strip recipes, motion feedback,
+migration, local editing agents, image-guided masks and multiscale memory,
+automatic exclusion of strip/cutout effects, motion feedback,
 actual codec I-frame removal and frame-count preservation, and real local OCR
 when Tesseract is installed. Fixtures are
 generated locally; tests use a local fake translation server and no real Telegram

@@ -6,7 +6,7 @@ import logging
 import weakref
 from io import BytesIO
 
-from PIL import Image, ImageChops, ImageEnhance, ImageOps
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -17,6 +17,7 @@ from artifact_memory import ArtifactMemory, open_image
 from language_glitch import Translator, TEXT_EXTENSIONS, decode_text, read_regions
 from memory_effects import inherit_image, inherit_bytes, glitch_text
 from image_agents import agent_canvas
+from image_surfaces import content_mask
 from content_fusion import trace, merge_traces, fuse_image, fuse_text, fuse_bytes
 from file_formats import CONTENT_EXTENSIONS, ContentLimitError, ContentUnavailable, run_content_job
 
@@ -391,6 +392,13 @@ def palette_crush(img, strength):
     return Image.blend(img, crushed, random.uniform(0.25, 0.72))
 
 
+def surface_erosion(img, strength):
+    """Let dark/light picture detail spread into neighbouring texture."""
+    operation = random.choice((ImageFilter.MinFilter(3), ImageFilter.MaxFilter(3)))
+    eroded = img.filter(operation).filter(ImageFilter.UnsharpMask(radius=1.5, percent=130, threshold=2))
+    return Image.blend(img, eroded, .2 + strength * .6)
+
+
 EFFECTS = {
     "rgb split": rgb_shift,
     "band drift": band_shift,
@@ -403,6 +411,7 @@ EFFECTS = {
     "feedback echo": feedback_echo,
     "compression ghosts": compression_ghost,
     "palette crush": palette_crush,
+    "surface erosion": surface_erosion,
 }
 
 
@@ -419,12 +428,14 @@ EFFECT_WEIGHTS = {
     "feedback echo": 0.85,
     "compression ghosts": 0.75,
     "palette crush": 0.45,
+    "surface erosion": 1.0,
 }
 STRIP_EFFECTS = {"band drift", "wave warp", "scanline dropout", "pixel sort"}
+AUTOMATIC_EFFECTS = ("rgb split", "surface erosion", "feedback echo", "compression ghosts", "palette crush")
 
 
 def _weighted_unique_effects(count):
-    names = list(EFFECTS)
+    names = list(AUTOMATIC_EFFECTS)
     picked = []
 
     while names and len(picked) < count:
@@ -512,7 +523,9 @@ def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=No
         # Each stage receives slightly different strength so two runs with the
         # same intensity do not collapse into the same visual grammar.
         stage_strength = min(1.0, max(0.05, strength * random.uniform(0.65, 1.35)))
-        img = EFFECTS[name](img, stage_strength)
+        changed = EFFECTS[name](img, stage_strength)
+        mask = content_mask(original, changed, random.uniform(.12, .4))
+        img = Image.composite(changed, img, mask)
 
     if fusion:
         img, mathematics = fuse_image(img, source, artifacts, intensity)
@@ -529,7 +542,7 @@ def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=No
     if output_format.upper() == "JPEG":
         img.save(buf, "JPEG", quality=random.randint(72, 94), subsampling=random.choice((0, 1, 2)))
         result = buf.getvalue()
-        if random.random() < 0.04 + strength * 0.13:
+        if not fusion and random.random() < 0.04 + strength * 0.13:
             bent = jpeg_databend(result, strength)
             if bent != result:
                 result = bent
