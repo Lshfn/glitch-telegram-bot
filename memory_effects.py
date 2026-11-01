@@ -2,56 +2,85 @@
 import random
 from io import BytesIO
 
-from PIL import Image, ImageChops, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageOps, ImageFilter
 
 from language_glitch import font
 
 
-def inherit_image(image, artifacts, strength):
+def visual_donors(artifacts, prefer_original=True):
+    """Prefer intact thumbnails; old databases fall back to their existing traces."""
+    sources = []
+    for artifact in artifacts:
+        data = (artifact.original_image or artifact.image) if prefer_original else artifact.image
+        if data:
+            with Image.open(BytesIO(data)) as donor:
+                sources.append(donor.convert("RGB"))
+    return sources
+
+
+def inherit_image(image, artifacts, strength, style=None):
     if not artifacts:
         return image, []
     out = image.copy()
-    sources = []
-    for artifact in random.sample(artifacts, min(len(artifacts), 4)):
-        if artifact.image:
-            sources.append(Image.open(BytesIO(artifact.image)).convert("RGB"))
-        elif artifact.sample:
-            raw = artifact.sample[:768].ljust(768, b"\x00")
-            sources.append(Image.frombytes("RGB", (32, 8), raw))
+    sources = visual_donors(random.sample(list(artifacts), min(len(artifacts), 6)))
+    if not sources:
+        for artifact in artifacts:
+            if artifact.sample:
+                raw = artifact.sample[:768].ljust(768, b"\x00")
+                sources.append(Image.frombytes("RGB", (16, 16), raw))
+                break
     labels = []
     if sources:
-        style = random.choice(("splice", "ghost", "difference", "mosaic", "channel"))
-        for _ in range(random.randint(2, 4 + int(strength * 8))):
+        style = style or random.choices(
+            ("fragment", "window", "ghost", "contour", "difference", "channel", "splice", "recursive"),
+            (5, 3, 2, 1.5, .25, .4, .12, .65))[0]
+        if style == "recursive":
+            sources = visual_donors(artifacts, prefer_original=False) or sources
+        for _ in range(random.randint(1, 2 + int(strength > .65))):
             donor = random.choice(sources)
-            w = random.randint(1, max(1, donor.width))
-            h = random.randint(1, max(1, donor.height))
-            x, y = random.randrange(donor.width - w + 1), random.randrange(donor.height - h + 1)
-            crop = donor.crop((x, y, x + w, y + h))
-            tw = random.randint(1, max(1, out.width // (2 if style == "mosaic" else 3)))
-            th = random.randint(1, max(1, out.height // 3))
+            # Crop a substantial region, then resize at one scale on both axes.
+            fraction = 1.0 if style == "window" else random.uniform(.6, 1)
+            w, h = max(1, round(donor.width * fraction)), max(1, round(donor.height * fraction))
+            sx, sy = random.randrange(donor.width - w + 1), random.randrange(donor.height - h + 1)
+            crop = donor.crop((sx, sy, sx + w, sy + h))
+            scale = min(out.width * random.uniform(.2, .65) / w, out.height * .65 / h)
+            tw, th = max(1, min(out.width, round(w * scale))), max(1, min(out.height, round(h * scale)))
             if style == "splice":
-                tw, th = out.width, random.randint(1, max(1, out.height // 12))
-            crop = crop.resize((tw, th), Image.Resampling.NEAREST)
+                # A rare thin cut retains its aspect ratio instead of stretching.
+                th = min(th, max(1, out.height // 30))
+                crop = crop.crop((0, 0, w, max(1, round(th / max(scale, .001)))))
+            crop = crop.resize((tw, th), Image.Resampling.LANCZOS)
             x, y = random.randrange(out.width - tw + 1), random.randrange(out.height - th + 1)
             base = out.crop((x, y, x + tw, y + th))
+            mask = Image.new("L", (tw, th), 255)
             if style == "ghost":
-                crop = Image.blend(base, crop, random.uniform(.18, .65))
+                mask = Image.new("L", (tw, th), random.randint(100, 200))
+            elif style == "contour":
+                mask = crop.convert("L").filter(ImageFilter.FIND_EDGES)
+                mask = ImageOps.autocontrast(mask).point(lambda p: 230 if p > 30 else 0)
             elif style == "difference":
                 crop = ImageChops.difference(base, crop)
             elif style == "channel":
                 channels = list(base.split())
                 channels[random.randrange(3)] = random.choice(crop.split())
                 crop = Image.merge("RGB", channels)
-            out.paste(crop, (x, y))
+            elif style == "fragment" and random.random() < .45:
+                mask = Image.new("L", (tw, th))
+                ImageDraw.Draw(mask).ellipse((0, 0, tw, th), fill=255)
+            out.paste(crop, (x, y), mask)
         labels.append("inherited " + style)
     snippets = [t for a in artifacts for t in a.text]
-    if snippets and (not sources or random.random() < .65):
+    if snippets and (not sources or random.random() < .55):
         draw = ImageDraw.Draw(out)
-        for _ in range(random.randint(1, 3)):
+        for _ in range(random.randint(1, 2)):
             text = random.choice(snippets)[:100]
             size = max(6, min(40, out.width // 22))
-            draw.text((random.randrange(out.width), random.randrange(out.height)), text,
-                      font=font(size), fill=random.choice(("white", "black", "magenta", "cyan")))
+            face = font(size)
+            # Keep the beginning of the remembered phrase inside the canvas.
+            x = random.randrange(max(1, out.width // 2))
+            y = random.randrange(max(1, out.height - size))
+            draw.text((x, y), text, font=face, stroke_width=1, stroke_fill="black",
+                      fill=random.choice(("white", "magenta", "cyan")))
         labels.append("inherited text")
     return out, labels
 

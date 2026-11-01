@@ -19,6 +19,7 @@ class Artifact:
     text: tuple[str, ...] = ()
     sample: bytes = b""
     signal: bytes = b""  # at most 2048 int16 values derived from decoded content
+    original_image: bytes = b""  # separate thumbnail, without the output's accumulated damage
 
 
 def open_image(data):
@@ -75,6 +76,8 @@ class ArtifactMemory:
             columns = {row[1] for row in db.execute("PRAGMA table_info(artifacts)")}
             if "signal" not in columns:
                 db.execute("ALTER TABLE artifacts ADD COLUMN signal BLOB NOT NULL DEFAULT X''")
+            if "original_image" not in columns:
+                db.execute("ALTER TABLE artifacts ADD COLUMN original_image BLOB NOT NULL DEFAULT X''")
             columns = {row[1] for row in db.execute("PRAGMA table_info(preferences)")}
             if "mode" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN mode TEXT NOT NULL DEFAULT 'fuse'")
@@ -108,18 +111,19 @@ class ArtifactMemory:
             self._prune(db)
             row = db.execute("SELECT level FROM artifacts WHERE chat=? AND digest=?",
                              (str(chat), digest)).fetchone()
-            rows = db.execute("SELECT image,text,sample,signal FROM artifacts WHERE chat=? "
+            rows = db.execute("SELECT image,text,sample,signal,original_image FROM artifacts WHERE chat=? "
                               "ORDER BY touched DESC LIMIT ?", (str(chat), self.per_chat)).fetchall()
         return min(12, (row[0] if row else 0) + 1), [
-            Artifact(image, tuple(json.loads(text)), sample, signal) for image, text, sample, signal in rows]
+            Artifact(image, tuple(json.loads(text)), sample, signal, original)
+            for image, text, sample, signal, original in rows]
 
     def remember(self, chat, digest, level, artifact):
         with self.lock, self._db() as db:
             db.execute("INSERT OR REPLACE INTO artifacts "
-                       "(chat,digest,touched,level,image,text,sample,signal) VALUES (?,?,?,?,?,?,?,?)",
+                       "(chat,digest,touched,level,image,text,sample,signal,original_image) VALUES (?,?,?,?,?,?,?,?,?)",
                        (str(chat), digest, time.time(), level, artifact.image,
                         json.dumps(artifact.text[:5], ensure_ascii=False), artifact.sample[:4096],
-                        artifact.signal[:4096]))
+                        artifact.signal[:4096], artifact.original_image))
             db.execute("DELETE FROM artifacts WHERE chat=? AND rowid NOT IN "
                        "(SELECT rowid FROM artifacts WHERE chat=? ORDER BY touched DESC LIMIT ?)",
                        (str(chat), str(chat), self.per_chat))

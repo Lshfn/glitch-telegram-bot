@@ -16,6 +16,7 @@ import aiohttp
 from artifact_memory import ArtifactMemory, open_image
 from language_glitch import Translator, TEXT_EXTENSIONS, decode_text, read_regions
 from memory_effects import inherit_image, inherit_bytes, glitch_text
+from image_agents import agent_canvas
 from content_fusion import trace, merge_traces, fuse_image, fuse_text, fuse_bytes
 from file_formats import CONTENT_EXTENSIONS, ContentLimitError, ContentUnavailable, run_content_job
 
@@ -24,7 +25,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 
-# Repeated file content escalates within the sender's history, across restarts.
+# Sender-local history survives restarts; repeats bias the lottery without locking it.
 memory = ArtifactMemory(os.getenv("MEMORY_DB", "data/artifacts.sqlite3"))
 translator = Translator(os.getenv("TRANSLATE_URL", ""), os.getenv("TRANSLATE_API_KEY", ""),
                         [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()])
@@ -42,14 +43,16 @@ def chat_lock(chat):
         chat_locks[chat] = lock
     return lock
 
-# Keep the escalation expressive without allowing accidental gigantic loops.
+# Keep processing expressive without allowing accidental gigantic loops.
 MAX_INTENSITY = 12
 
 
 def automatic_intensity(repeat_level):
-    """Vary the force of each upload; repeated content keeps escalating."""
-    minimum = min(MAX_INTENSITY, max(4, repeat_level))
-    return random.randint(minimum, MAX_INTENSITY)
+    """Allow quiet returns even after a violent render; repeats only bias odds."""
+    pressure = min(1, max(0, repeat_level - 1) / 11)
+    weights = (2, 3, 4, 5, 5, 4, 3, 2.5, 2, 1.5, 1, .8)
+    return random.choices(range(1, MAX_INTENSITY + 1),
+                          [w * (1 + pressure * i / 6) for i, w in enumerate(weights)])[0]
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +139,13 @@ def rgb_shift(img, strength):
 def band_shift(img, strength):
     """Move irregular horizontal strips independently."""
     out = img.copy()
-    count = random.randint(2, 4 + int(strength * 18))
-    max_shift = max(4, int(img.width * (0.02 + strength * 0.24)))
+    count = random.randint(1, 2 + int(strength * 5))
+    max_shift = max(2, int(img.width * (0.01 + strength * 0.08)))
 
     for _ in range(count):
         h = random.randint(
-            max(1, img.height // 120),
-            max(2, img.height // max(8, int(45 - strength * 30))),
+            1,
+            max(1, img.height // 70),
         )
         y = random.randint(0, max(0, img.height - h))
         strip = out.crop((0, y, img.width, y + h))
@@ -163,7 +166,7 @@ def band_shift(img, strength):
 def block_displace(img, strength):
     """Duplicate, displace, mirror and occasionally invert rectangular regions."""
     out = img.copy()
-    count = random.randint(2, 3 + int(strength * 14))
+    count = random.randint(1, 2 + int(strength * 6))
 
     for _ in range(count):
         bw = random.randint(max(4, img.width // 30), max(5, img.width // 3))
@@ -218,17 +221,14 @@ def wave_warp(img, strength):
     """Horizontal sinusoidal displacement with variable frequency and phase."""
     out = Image.new("RGB", img.size)
     strip_h = random.randint(1, max(2, int(3 + 8 * (1 - strength))))
-    amplitude = max(2, int(img.width * random.uniform(0.01, 0.04 + 0.08 * strength)))
+    amplitude = max(1, int(img.width * random.uniform(0.005, 0.01 + 0.04 * strength)))
     wavelength = random.uniform(12, 90 - min(60, strength * 45))
     phase = random.uniform(0, math.tau)
 
     for y in range(0, img.height, strip_h):
         h = min(strip_h, img.height - y)
         strip = img.crop((0, y, img.width, y + h))
-        local_amp = amplitude * random.uniform(0.65, 1.35)
-        dx = int(local_amp * math.sin((y / wavelength) + phase))
-        if random.random() < 0.04 + strength * 0.12:
-            dx += random.randint(-amplitude, amplitude)
+        dx = int(amplitude * math.sin((y / wavelength) + phase))
         out.paste(ImageChops.offset(strip, dx, 0), (0, y))
 
     return out
@@ -237,11 +237,11 @@ def wave_warp(img, strength):
 def scanline_dropout(img, strength):
     """Create analog-looking scanline dropouts, streaks and small slices."""
     out = img.copy()
-    count = random.randint(3, 8 + int(strength * 25))
+    count = random.randint(1, 3 + int(strength * 5))
 
     for _ in range(count):
         y = random.randrange(img.height)
-        h = random.randint(1, max(1, int(1 + strength * 8)))
+        h = random.randint(1, max(1, int(1 + strength * 2)))
         h = min(h, img.height - y)
         if h <= 0:
             continue
@@ -409,17 +409,18 @@ EFFECTS = {
 # Weights make some effects common and others feel like rarer surprises.
 EFFECT_WEIGHTS = {
     "rgb split": 1.25,
-    "band drift": 1.55,
-    "block displacement": 1.35,
+    "band drift": 0.15,
+    "block displacement": 0.65,
     "channel blocks": 0.85,
-    "wave warp": 0.9,
-    "scanline dropout": 1.2,
-    "pixel sort": 1.0,
-    "noise clusters": 0.8,
-    "feedback echo": 0.65,
+    "wave warp": 0.18,
+    "scanline dropout": 0.12,
+    "pixel sort": 0.28,
+    "noise clusters": 0.45,
+    "feedback echo": 0.85,
     "compression ghosts": 0.75,
     "palette crush": 0.45,
 }
+STRIP_EFFECTS = {"band drift", "wave warp", "scanline dropout", "pixel sort"}
 
 
 def _weighted_unique_effects(count):
@@ -431,6 +432,8 @@ def _weighted_unique_effects(count):
         choice = random.choices(names, weights=weights, k=1)[0]
         picked.append(choice)
         names.remove(choice)
+        if choice in STRIP_EFFECTS:
+            names = [name for name in names if name not in STRIP_EFFECTS]
 
     return picked
 
@@ -438,20 +441,17 @@ def _weighted_unique_effects(count):
 def make_glitch_recipe(intensity):
     """Build a different recipe for every render."""
     level = min(max(intensity, 1), MAX_INTENSITY)
-    strength = min(1.0, 0.10 + level * 0.075 + random.uniform(-0.04, 0.08))
-
-    # Level 1 is already visibly glitched; higher levels become denser rather
-    # than simply multiplying the same operation over and over.
-    minimum = 2 if level <= 2 else 3
-    maximum = min(len(EFFECTS), 3 + level // 2)
-    count = random.randint(minimum, max(minimum, maximum))
+    strength = random.uniform(.035 + level * .012, .15 + level * .055)
+    count = random.randint(1, 2 + level // 4)
 
     recipe = _weighted_unique_effects(count)
     random.shuffle(recipe)
 
-    # At high intensity, occasionally repeat one effect at a different strength.
-    if level >= 5 and random.random() < 0.35:
-        recipe.insert(random.randrange(len(recipe) + 1), random.choice(recipe))
+    if level >= 8 and random.random() < 0.12:
+        # Repeated strokes are occasional; a strip is never repeated.
+        repeatable = [name for name in recipe if name not in STRIP_EFFECTS]
+        if repeatable:
+            recipe.insert(random.randrange(len(recipe) + 1), random.choice(repeatable))
 
     return recipe, strength
 
@@ -503,16 +503,10 @@ def jpeg_databend(data, strength):
 
 def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=None, source=None, fusion=True):
     img = prepared.copy() if prepared is not None else open_image(data)
+    original = img.copy()
     if fusion and source is None:
         source = trace(data, image=img)
     recipe, strength = make_glitch_recipe(intensity)
-
-    # Inheritance can enter before or after the current upload's own effects.
-    memory_first = random.random() < .5
-    if memory_first:
-        img, inherited = inherit_image(img, artifacts, strength)
-    else:
-        inherited = []
 
     for name in recipe:
         # Each stage receives slightly different strength so two runs with the
@@ -523,16 +517,19 @@ def glitch_image(data, intensity, output_format="PNG", artifacts=(), prepared=No
     if fusion:
         img, mathematics = fuse_image(img, source, artifacts, intensity)
         recipe.extend(mathematics)
+        if random.random() < .38:
+            img, agents = agent_canvas(img, original, artifacts, intensity)
+            recipe.extend(agents)
 
-    if not memory_first:
-        img, inherited = inherit_image(img, artifacts, strength)
+    # Memory arrives last, so the selected scene/words can still be recognised.
+    img, inherited = inherit_image(img, artifacts, strength)
     recipe.extend(inherited)
 
     buf = BytesIO()
     if output_format.upper() == "JPEG":
         img.save(buf, "JPEG", quality=random.randint(72, 94), subsampling=random.choice((0, 1, 2)))
         result = buf.getvalue()
-        if random.random() < 0.20 + strength * 0.40:
+        if random.random() < 0.04 + strength * 0.13:
             bent = jpeg_databend(result, strength)
             if bent != result:
                 result = bent

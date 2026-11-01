@@ -334,10 +334,14 @@ class FormatTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContentLimitError):
             await engine.process_upload(data.getvalue(), "expanded.docx", 12, [])
 
-    async def test_legacy_images_still_receive_old_effects_and_new_mathematics(self):
-        _, recipe, _, _, _ = await engine.process_upload(image_bytes(), "a.png", 12, [])
-        self.assertTrue(set(recipe) & set(engine.EFFECTS))
-        self.assertTrue(set(recipe) & set(IMAGE_METHODS))
+    async def test_legacy_effects_and_mathematics_remain_available_with_quieter_recipes(self):
+        seen = set()
+        for seed in range(12):
+            random.seed(seed)
+            _, recipe, _, _, _ = await engine.process_upload(image_bytes(), "a.png", 8, [])
+            seen.update(recipe)
+            self.assertTrue(set(recipe) & set(engine.EFFECTS))
+        self.assertTrue(seen & set(IMAGE_METHODS))
 
 
 class WorkerDeadlineTests(unittest.TestCase):
@@ -384,15 +388,14 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(memory.snapshot("1:3", "other")[1]), 1)
                 message.answer.assert_awaited_once_with("Memory cleared.")
 
-    def test_automatic_intensity_varies_reaches_maximum_and_escalates(self):
+    def test_automatic_intensity_can_be_quiet_after_maximum_and_still_reach_twelve(self):
         random.seed(101)
-        levels = {engine.automatic_intensity(1) for _ in range(80)}
-        self.assertTrue(all(4 <= level <= 12 for level in levels))
-        self.assertGreater(len(levels), 5)
-        self.assertIn(12, levels)
-        for repeat_level in range(4, 13):
-            for _ in range(10):
-                self.assertTrue(repeat_level <= engine.automatic_intensity(repeat_level) <= 12)
+        for repeat in (1, 6, 12):
+            levels = [engine.automatic_intensity(repeat) for _ in range(400)]
+            self.assertTrue(all(1 <= level <= 12 for level in levels))
+            self.assertTrue(set(range(1, 13)) <= set(levels))
+            self.assertGreater(sum(level <= 4 for level in levels), 40)
+            self.assertLess(sum(level >= 10 for level in levels), 150)
 
     async def test_voice_upload_is_automatic_ignores_legacy_settings_and_has_no_caption(self):
         upload = SimpleNamespace(file_size=128, file_id="voice", file_name=None)
@@ -410,11 +413,11 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(engine, "memory", memory), patch.object(engine, "bot", bot), patch.object(engine, "process_upload", processor):
                 await engine.handle_file(message)
                 first_level = processor.call_args.args[2]
-                self.assertTrue(4 <= first_level <= 12)
+                self.assertTrue(1 <= first_level <= 12)
                 self.assertEqual(processor.call_args.args[1], "voice.ogg")
                 self.assertEqual(processor.call_args.args[3:], ([], False))
                 await engine.handle_file(message)
-                self.assertGreaterEqual(processor.call_args.args[2], min(12, first_level + 1))
+                self.assertTrue(1 <= processor.call_args.args[2] <= 12)
                 self.assertEqual(len(processor.call_args.args[3]), 1)
             self.assertEqual(message.reply_document.await_count, 2)
             for call in message.reply_document.await_args_list:

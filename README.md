@@ -8,7 +8,7 @@ images break apart, fragments of earlier uploads return, and words slip into oth
 
 ## How it works
 
-The bot makes images inherit crops, scan strips, ghost layers, channel fragments
+The bot makes images inherit recognisable crops, windows, ghost layers, contours
 and snippets from previous uploads. Documents, sound and moving images now take
 part in the same memory. A paragraph can become a displacement field for an
 image; an audio waveform can become a document's word-order pattern; video frames
@@ -18,8 +18,24 @@ The original eleven image effects, JPEG databend, phrase inheritance, translatio
 and byte chaos remain. Each render chooses a different recipe and order.
 Processing is automatic: the bot selects the route from the file type, and its
 content and earlier uploads supply the transformation material. Intensity varies
-between 4 and 12 on the first upload; reuploading the same content raises its
-minimum intensity, even if Telegram gives it a different file ID.
+from 1 to 12, with quieter and medium-strength recipes more frequent. Repeated
+content gently biases the draw towards stronger effects, without locking later
+uploads at maximum intensity. A violent render can be followed by a quiet one.
+
+Image recipes no longer stack multiple strip effects. Strip weights, width and
+counts are reduced, and numerical transformations normally affect soft local
+regions. Memory is applied last, with substantial crops resized at one scale on
+both axes. Original thumbnails supply most recognisable fragments; occasional
+recursive memories use the earlier output instead. Earlier documents can return
+as readable phrases and page fragments, and earlier audio as projected signals.
+
+Some images use small autonomous editing agents inspired by
+[RRR's 0..1](https://rulesrulesrules.studio/art/0-1). They read changing edge and
+brightness maps, move locally and interact through smudging, sharpening,
+restoration, sampling older material, prism shifts, pixel trails and contour ink.
+Protected islands resist their edits. Local pixel values can change an agent's
+next tool and brush radius. This is a bounded adaptation of the tool-interaction
+idea; the reference images and implementation are not copied into the bot.
 
 There is no setup dialogue, processing command menu or technical caption on
 returned files. `/start` and `/help` reply with a single symbol. Other text is
@@ -51,7 +67,15 @@ The additional mathematical variations include:
 - Audio spectral vocoding, content-derived convolution kernels, grain
   permutations, phase modulation and wavefolding.
 - Logistic-map word permutations using the source and earlier uploads.
-- Video frame permutations and delayed-frame blend, scan and difference feedback.
+- Occasional short video frame permutations and delayed-frame feedback.
+- Block motion estimation that advects an old frame, with low residual refresh,
+  blooming and periodic recovery. A clip keeps its image recipe across frames.
+- Actual codec datamoshing on some clips: encode a temporary MPEG-4 Part 2 stream
+  without B frames, remove later I-frame payloads while retaining the first,
+  decode it, restore removed time slots with a held preceding frame, then rebuild
+  a playable H.264 MP4 with the processed audio. Decoder failures retain the
+  decoded-frame effects; resource limit failures are still reported. See the
+  [FFmpeg bitstream documentation](https://www.ffmpeg.org/ffmpeg-bitstream-filters.html).
 - Finite-field multiplication, convolution modulo 256 and modular weaving for
   generic payload bytes.
 
@@ -72,12 +96,15 @@ remains available internally to the engine; users do not choose processing modes
 Histories belong to **one sender in one chat**. Nothing crosses between users or
 chats. The bot remembers traces of up to 24 distinct recent uploads per history,
 256 uploads in total, for seven days; repeated content updates its existing entry.
-Only a small re-encoded thumbnail/contact sheet, up to five text excerpts, up to
+Only two small re-encoded thumbnails/contact sheets (original and transformed,
+each up to 320 px), up to five text excerpts, up to
 4 KB of payload fragments and up to 4 KB of projected content signals are
 retained. These traces combine original and transformed material. Complete files
 and filenames are not stored in the history. Temporary decoder files are deleted
 after processing. Effects from earlier outputs can recur and drift through later
 ones. Existing SQLite histories migrate automatically and retain their old traces.
+Old entries without an original thumbnail use their existing image trace until
+new uploads supply the separate original and transformed thumbnails.
 
 The optional `/forget` command clears that history, intensity and translation
 preference, with a brief acknowledgement. It is not advertised in a bot menu.
@@ -170,7 +197,10 @@ and transformed traces, every mathematical image/audio variation, Unicode text,
 reopened DOCX/PDF/WAV files, MP4 video and audio decoding, resource limits, the
 destructive fallback, automatic intensity and routing, silent file replies,
 command-menu cleanup, failed delivery, translation HTTP
-requests/failures, and real local OCR when Tesseract is installed. Fixtures are
+requests/failures, recognisable memory proportions, intact/processed thumbnail
+migration, local editing agents, non-stacking strip recipes, motion feedback,
+actual codec I-frame removal and frame-count preservation, and real local OCR
+when Tesseract is installed. Fixtures are
 generated locally; tests use a local fake translation server and no real Telegram
 account or third-party user content. Provider
 translation quality and the deployed Telegram/Render environment still need a
