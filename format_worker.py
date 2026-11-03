@@ -9,11 +9,12 @@ def main():
     root = Path(sys.argv[1])
     # Set limits before loading NumPy, XML/image libraries, or any uploaded data.
     import resource
+    from bot_settings import WORKER_CPU_SECONDS
     # FFmpeg's shared libraries also count toward virtual address space.
     resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024,) * 2)
-    resource.setrlimit(resource.RLIMIT_CPU, (45, 45))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (96 * 1024 * 1024,) * 2)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
+    resource.setrlimit(resource.RLIMIT_CPU, (WORKER_CPU_SECONDS, WORKER_CPU_SECONDS))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024 * 1024,) * 2)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (512, 512))
     try:
         from io import BytesIO
         from PIL import Image
@@ -42,7 +43,7 @@ def main():
         result, recipe, artifact, notices, extension = process_content(
             root / ("input" + extension), extension, level, artifacts, render)
         if len(result) > MAX_OUTPUT:
-            raise ContentLimitError("The fused file exceeds the 16 MB output limit.")
+            raise ContentLimitError(f"The fused file exceeds the {MAX_OUTPUT // (1024 * 1024)} MB output limit.")
         (root / "output").write_bytes(result)
         metadata = {"recipe": recipe, "artifact": pack_artifact(artifact),
                     "notices": notices, "extension": extension}

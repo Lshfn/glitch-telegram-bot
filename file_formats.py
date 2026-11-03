@@ -23,15 +23,13 @@ from content_fusion import donor_signal, fuse_audio, fuse_text, merge_traces, tr
 from language_glitch import font
 from memory_effects import glitch_text
 from video_mosh import motion_feedback, remove_intra_frames, frame_types
+from bot_settings import (MAX_PAGES, MAX_AUDIO_SECONDS, MAX_VIDEO_SECONDS, MAX_OUTPUT,
+                          MAX_PDF_TEXT, MAX_VIDEO_FRAMES, WORKER_WALL_SECONDS)
 
 DOCUMENT_EXTENSIONS = (".docx", ".pdf")
 AUDIO_EXTENSIONS = (".wav", ".mp3", ".ogg", ".oga", ".flac", ".m4a", ".aac", ".opus", ".aiff", ".aif")
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".gif")
 CONTENT_EXTENSIONS = DOCUMENT_EXTENSIONS + AUDIO_EXTENSIONS + VIDEO_EXTENSIONS
-MAX_PAGES = 12
-MAX_AUDIO_SECONDS = 60
-MAX_VIDEO_SECONDS = 12
-MAX_OUTPUT = 16 * 1024 * 1024
 SAMPLE_RATE = 22050
 VIDEO_FPS = 8
 
@@ -68,20 +66,21 @@ def run_content_job(data, extension, level, artifacts):
                   "artifacts": [pack_artifact(a) for a in artifacts]}
         (root / "job.json").write_text(json.dumps(config), encoding="utf-8")
         env = dict(os.environ, BOT_TOKEN="", MEMORY_DB=str(root / "worker.sqlite3"),
+                   TURSO_DATABASE_URL="", TURSO_AUTH_TOKEN="",
                    OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
                    MALLOC_ARENA_MAX="2")
         command = [sys.executable, str(Path(__file__).with_name("format_worker.py")), str(root)]
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    env=env, start_new_session=True)
         try:
-            process.wait(timeout=60)
+            process.wait(timeout=WORKER_WALL_SECONDS)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process.wait()
-            raise ContentLimitError("Content processing reached 60 seconds. Try a smaller file.")
+            raise ContentLimitError(f"Content processing reached {WORKER_WALL_SECONDS} seconds.")
         metadata_path = root / "result.json"
         if not metadata_path.exists():
             # CPU/address-space limits may stop the worker before it can report.
@@ -96,12 +95,12 @@ def run_content_job(data, extension, level, artifacts):
             raise error(metadata["message"])
         result = root / "output"
         if result.stat().st_size > MAX_OUTPUT:
-            raise ContentLimitError("The fused file exceeded the 16 MB output limit.")
+            raise ContentLimitError(f"The fused file exceeded the {MAX_OUTPUT // (1024 * 1024)} MB output limit.")
         return (result.read_bytes(), metadata["recipe"], unpack_artifact(metadata["artifact"]),
                 metadata["notices"], metadata["extension"])
 
 
-def run_tool(args, timeout=20, stage="decode"):
+def run_tool(args, timeout=60, stage="decode"):
     if not shutil.which(args[0]):
         raise ContentUnavailable("A required local decoder is missing; use the Docker setup.")
     try:
@@ -206,14 +205,14 @@ def pdf_content(path, level, artifacts, render):
         raise ContentUnavailable("PDF page count could not be read.")
     pages = int(match[1])
     if not 1 <= pages <= MAX_PAGES:
-        raise ContentLimitError("PDFs must contain 1–12 pages for content fusion.")
+        raise ContentLimitError(f"PDFs must contain 1–{MAX_PAGES} pages for content fusion.")
     text_path = root / "text.txt"
     run_tool(["pdftotext", "-enc", "UTF-8", str(path), str(text_path)])
-    if text_path.stat().st_size > 256 * 1024:
-        raise ContentLimitError("PDF extracted text exceeds 256 KB.")
+    if text_path.stat().st_size > MAX_PDF_TEXT:
+        raise ContentLimitError(f"PDF extracted text exceeds {MAX_PDF_TEXT // (1024 * 1024)} MB.")
     text = text_path.read_text(encoding="utf-8")
     run_tool(["pdftoppm", "-f", "1", "-l", str(pages), "-scale-to", "960", "-r", "72",
-              "-png", str(path), str(root / "page")], timeout=25)
+              "-png", str(path), str(root / "page")], timeout=90, stage="PDF raster")
     files = sorted(root.glob("page-*.png"), key=lambda p: int(p.stem.rsplit("-", 1)[1]))
     if len(files) != pages:
         raise ContentUnavailable("PDF pages could not all be rendered.")
@@ -222,7 +221,8 @@ def pdf_content(path, level, artifacts, render):
     woven, maths = fuse_text(woven, source, artifacts, level)
     labels += maths + ["PDF page raster"]
     words = woven.split()
-    outputs = []
+    outputs, previews = [], []
+    preview_indices = set(np.linspace(0, pages - 1, min(16, pages), dtype=int))
     field = donor_signal(source, artifacts, max(1, pages * 4))
     for i, file in enumerate(files):
         image, effects = render(open_image(file.read_bytes()), source)
@@ -235,11 +235,18 @@ def pdf_content(path, level, artifacts, render):
             y = int(abs(field[i * 4 + 1]) * image.height * .8)
             # Text is a real extracted/donor phrase, never generated placeholder text.
             draw.text((x, y), snippet, font=font(max(8, image.width // 45)), fill="magenta")
-        outputs.append(image)
-    output = BytesIO()
-    outputs[0].save(output, "PDF", save_all=True, append_images=outputs[1:], resolution=96)
-    result = output.getvalue()
-    artifact = merge_traces(source, trace(result, woven, contact_sheet(outputs)))
+        output = root / f"fused-page-{i + 1:04d}.pdf"
+        image.save(output, "PDF", resolution=96, quality=75)
+        outputs.append(output)
+        if i in preview_indices:
+            preview = image.copy()
+            preview.thumbnail((160, 160))
+            previews.append(preview)
+        image.close()
+    target = root / "fused.pdf"
+    run_tool(["pdfunite", *map(str, outputs), str(target)], timeout=90, stage="PDF merge")
+    result = target.read_bytes()
+    artifact = merge_traces(source, trace(result, woven, contact_sheet(previews)))
     return (result, list(dict.fromkeys(labels)), artifact,
             ["PDF pages rasterized: selectable text, links and forms are flattened."], ".pdf")
 
@@ -284,11 +291,11 @@ def waveform_image(samples):
     return image
 
 
-def codec_datamosh(frames_dir, root, count):
+def codec_datamosh(frames_dir, root, count, fps=VIDEO_FPS):
     """Remove actual intra frames in a temporary predictive stream, then decode."""
     source, bent = root / "prediction.m4v", root / "moshed.m4v"
     command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-cpucount", "1",
-               "-filter_threads", "1", "-threads", "1", "-framerate", str(VIDEO_FPS),
+               "-filter_threads", "1", "-threads", "1", "-framerate", str(fps),
                "-i", str(frames_dir / "%04d.png"), "-an", "-c:v", "mpeg4", "-bf", "0",
                "-g", "4", "-sc_threshold", "0", "-q:v", "4", "-pix_fmt", "yuv420p",
                "-threads", "1", "-f", "m4v", str(source)]
@@ -331,11 +338,13 @@ def media_content(path, extension, level, artifacts, render):
     is_video = extension in VIDEO_EXTENSIONS
     maximum = MAX_VIDEO_SECONDS if is_video else MAX_AUDIO_SECONDS
     durations = [probe.get("format", {}).get("duration")] + [s.get("duration") for s in streams]
+    measured = []
     for duration in durations:
         if duration not in (None, "N/A"):
             value = float(duration)
             if not math.isfinite(value) or value < 0 or value > maximum + .05:
                 raise ContentLimitError(f"Content fusion accepts video up to {MAX_VIDEO_SECONDS}s and audio up to {MAX_AUDIO_SECONDS}s.")
+            measured.append(value)
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
     samples = audio_decode(path, maximum) if has_audio else None
     if not is_video:
@@ -353,17 +362,23 @@ def media_content(path, extension, level, artifacts, render):
         raise ContentUnavailable("No video stream was found.")
     if video_stream.get("width", 0) * video_stream.get("height", 0) > 12_000_000:
         raise ContentLimitError("Video frames exceed 12 megapixels.")
+    duration = max(measured, default=float(maximum))
+    fps = min(VIDEO_FPS, max(1, int(MAX_VIDEO_FRAMES / max(1, duration))))
+    edge = 480 if duration <= 30 else 384
+    box_width = max(2, min(edge, int(video_stream.get("width") or edge)))
+    box_height = max(2, min(edge, int(video_stream.get("height") or edge)))
+    frame_limit = min(MAX_VIDEO_FRAMES, maximum * fps)
     frames_dir, fused_dir = root / "frames", root / "fused"
     frames_dir.mkdir()
     fused_dir.mkdir()
     run_tool(["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "1",
               "-protocol_whitelist", "file,pipe", "-format_whitelist", INPUT_FORMATS,
               "-i", str(path), "-map", "0:v:0", "-an", "-t", str(maximum + 1),
-              "-vf", f"fps={VIDEO_FPS},scale=480:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
-              "-frames:v", str(maximum * VIDEO_FPS + 1), "-threads", "1",
-              str(frames_dir / "%04d.png")], stage="video decode")
+              "-vf", f"fps={fps},scale={box_width}:{box_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
+              "-frames:v", str(frame_limit + 1), "-threads", "1",
+              str(frames_dir / "%04d.png")], timeout=90, stage="video decode")
     frames = sorted(frames_dir.glob("*.png"))
-    if len(frames) > maximum * VIDEO_FPS:
+    if len(frames) > frame_limit:
         raise ContentLimitError(f"Video exceeds the {maximum}-second content limit.")
     if not frames:
         raise ContentUnavailable("Video contains no decodable frames.")
@@ -408,7 +423,7 @@ def media_content(path, extension, level, artifacts, render):
     encode_dir = fused_dir
     if len(frames) > 4 and random.random() < .45:
         try:
-            encode_dir, used = codec_datamosh(fused_dir, root, len(frames))
+            encode_dir, used = codec_datamosh(fused_dir, root, len(frames), fps)
             if used:
                 labels.append("codec I-frame removal")
                 previews = [open_image(p.read_bytes()) for p in sorted(encode_dir.glob("*.png"))[::max(1, len(frames) // 12)]]
@@ -417,7 +432,7 @@ def media_content(path, extension, level, artifacts, render):
             encode_dir = fused_dir
             labels.append("codec mosh unavailable; temporal effects retained")
     command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-cpucount", "1", "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "1",
-               "-framerate", str(VIDEO_FPS), "-i", str(encode_dir / "%04d.png")]
+               "-framerate", str(fps), "-i", str(encode_dir / "%04d.png")]
     audio_output = None
     if samples is not None:
         audio_output, audio_effects = fuse_audio(samples, source, artifacts, level)
@@ -425,14 +440,16 @@ def media_content(path, extension, level, artifacts, render):
         write_wave(root / "sound.wav", audio_output)
         command += ["-i", str(root / "sound.wav"), "-c:a", "aac", "-b:a", "96k"]
     target = root / "fused.mp4"
+    target_duration = duration if measured else len(frames) / fps
     command += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-threads", "1", "-preset", "veryfast", "-tune", "zerolatency",
                 "-x264-params", "threads=1:lookahead_threads=1:sync-lookahead=0:rc-lookahead=0",
-                "-crf", "26", "-movflags", "+faststart", "-t", str(len(frames) / VIDEO_FPS), str(target)]
-    run_tool(command, timeout=25, stage="video encode")
+                "-crf", "26", "-movflags", "+faststart", "-vf", "tpad=stop_mode=clone:stop_duration=1",
+                "-t", str(target_duration), str(target)]
+    run_tool(command, timeout=90, stage="video encode")
     result = target.read_bytes()
     artifact = merge_traces(source, trace(result, image=contact_sheet(previews), waveform=audio_output))
     return (result, list(dict.fromkeys(labels)), artifact,
-            ["Video rebuilt as MP4, 8 fps, up to 480 px; any audio is fused too."], ".mp4")
+            [f"Video rebuilt as MP4, {fps} fps, up to {edge} px; full duration and any audio retained."], ".mp4")
 
 
 def process_content(path, extension, level, artifacts, render):

@@ -61,7 +61,7 @@ class MemoryTests(unittest.TestCase):
     def test_expiry(self):
         with patch("artifact_memory.time.time", return_value=100):
             self.memory.remember("a", "a", 1, Artifact(text=("old",)))
-        with patch("artifact_memory.time.time", return_value=100 + 8 * 86400):
+        with patch("artifact_memory.time.time", return_value=100 + 181 * 86400):
             self.assertEqual(self.memory.snapshot("a", "a"), (1, []))
 
     def test_extracted_trace_is_bounded(self):

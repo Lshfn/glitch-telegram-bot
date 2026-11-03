@@ -50,6 +50,19 @@ def project(values):
     return (unit(values) * 32767).astype("<i2").tobytes()
 
 
+def project_bytes(data):
+    """Project the entire payload without allocating a float copy of a large file."""
+    if len(data) <= TRACE_SIZE:
+        return project(np.frombuffer(data, dtype=np.uint8).astype(np.float32) / 127.5 - 1)
+    edges = np.linspace(0, len(data), TRACE_SIZE + 1, dtype=np.int64)
+    pooled = np.empty(TRACE_SIZE, dtype=np.float32)
+    for i, (start, end) in enumerate(zip(edges[:-1], edges[1:])):
+        values = np.frombuffer(data, dtype=np.uint8, count=int(end - start), offset=int(start))
+        values = values.astype(np.float32) / 127.5 - 1
+        pooled[i] = np.sqrt(np.mean(values * values)) * (-1 if np.mean(values) < 0 else 1)
+    return project(pooled)
+
+
 def signal_of(artifact):
     if artifact.signal:
         bounded = artifact.signal[:4096]
@@ -79,7 +92,7 @@ def trace(data=b"", text="", image=None, waveform=None):
     if waveform is not None:
         signals.append(project(waveform))
     if data:
-        signals.append(project(np.frombuffer(data, dtype=np.uint8).astype(np.float32) / 127.5 - 1))
+        signals.append(project_bytes(data))
     # Different modalities occupy different parts of one bounded signal.
     joined = np.concatenate([np.frombuffer(s, dtype="<i2").astype(np.float32)
                              for s in signals]) if signals else []

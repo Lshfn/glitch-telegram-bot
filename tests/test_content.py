@@ -21,7 +21,7 @@ from PIL import Image, ImageOps
 from artifact_memory import Artifact, ArtifactMemory
 from content_fusion import (AUDIO_METHODS, IMAGE_METHODS, donor_signal, fuse_audio,
                             fuse_bytes, fuse_image, fuse_text, merge_traces, trace)
-from file_formats import ContentLimitError, ContentUnavailable, run_content_job, run_tool
+from file_formats import ContentLimitError, ContentUnavailable, run_content_job, run_tool, MAX_PAGES
 
 _temp = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"BOT_TOKEN": "", "MEMORY_DB": str(Path(_temp.name) / "engine.sqlite3")}):
@@ -187,7 +187,8 @@ class MigrationTests(unittest.TestCase):
             self.assertTrue(reopened.translations("a"))
             artifact = trace(waveform=np.arange(9000))
             reopened.remember("a", "new", 12, artifact)
-            self.assertTrue(reopened.snapshot("a", "new")[1][0].signal)
+            self.assertEqual(reopened.snapshot("a", "new")[1][0].text, ("old words",))
+            self.assertTrue(any(a.signal for a in reopened.snapshot("a", "")[1]))
             self.assertEqual(reopened.settings("b"), ("fuse", 0))
             self.assertEqual(reopened.snapshot("b", "new")[1], [])
             reopened.forget("a")
@@ -324,8 +325,8 @@ class FormatTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(shutil.which("pdfinfo"), "Poppler not installed")
     async def test_page_limit_is_reported_without_destructive_fallback(self):
-        with self.assertRaisesRegex(ContentLimitError, "1–12"):
-            await engine.process_upload(pdf_bytes(13), "long.pdf", 12, [])
+        with self.assertRaisesRegex(ContentLimitError, f"1–{MAX_PAGES}"):
+            await engine.process_upload(pdf_bytes(MAX_PAGES + 1), "long.pdf", 12, [])
 
     async def test_archive_expansion_is_rejected_before_xml_is_loaded(self):
         data = BytesIO()
@@ -404,7 +405,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                                   video_note=None, animation=None, document=None,
                                   answer=AsyncMock(), reply_document=AsyncMock())
         bot = SimpleNamespace(get_file=AsyncMock(return_value=SimpleNamespace(file_path="voice.ogg")),
-                              download_file=AsyncMock(side_effect=lambda _: BytesIO(b"uploaded bytes")))
+                              download_file=AsyncMock(side_effect=lambda *a, **k: BytesIO(b"uploaded bytes")))
         with tempfile.TemporaryDirectory() as root:
             memory = ArtifactMemory(Path(root) / "memory.sqlite3")
             memory.settings("1:2", mode="raw", chaos=1)

@@ -8,33 +8,50 @@ from io import BytesIO
 
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
 from aiogram import Bot, Dispatcher, types
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import BufferedInputFile
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 import aiohttp
 
-from artifact_memory import ArtifactMemory, open_image
+from artifact_memory import configured_memory, open_image
 from language_glitch import Translator, TEXT_EXTENSIONS, decode_text, read_regions
 from memory_effects import inherit_image, inherit_bytes, glitch_text
 from image_agents import agent_canvas
 from image_surfaces import content_mask
 from content_fusion import trace, merge_traces, fuse_image, fuse_text, fuse_bytes
 from file_formats import CONTENT_EXTENSIONS, ContentLimitError, ContentUnavailable, run_content_job
+from bot_settings import MAX_UPLOAD, MAX_UPLOAD_MB, MAX_OUTPUT, BOT_API_URL, BOT_API_LOCAL_FILES
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+def make_bot(token):
+    options = {"timeout": 180}
+    if BOT_API_URL:
+        options["api"] = TelegramAPIServer.from_base(BOT_API_URL, is_local=BOT_API_LOCAL_FILES)
+    return Bot(token=token, session=AiohttpSession(**options))
+
+
+class UploadBuffer(BytesIO):
+    """Enforce the byte limit while downloading, including absent size metadata."""
+    def write(self, data):
+        if self.tell() + len(data) > MAX_UPLOAD:
+            raise ContentLimitError(f"File exceeds {MAX_UPLOAD_MB} MB.")
+        return super().write(data)
+
+
+bot = make_bot(BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 
-# Sender-local history survives restarts; repeats bias the lottery without locking it.
-memory = ArtifactMemory(os.getenv("MEMORY_DB", "data/artifacts.sqlite3"))
+# Sender-local history; remote storage can survive free-host restarts.
+memory = configured_memory()
 translator = Translator(os.getenv("TRANSLATE_URL", ""), os.getenv("TRANSLATE_API_KEY", ""),
                         [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()])
 processing_slots = asyncio.Semaphore(2)
 content_slots = asyncio.Semaphore(1)
 chat_locks = weakref.WeakValueDictionary()
 logger = logging.getLogger(__name__)
-MAX_UPLOAD = 10 * 1024 * 1024
 
 
 def chat_lock(chat):
@@ -678,7 +695,7 @@ async def handle_file(message: types.Message):
         if not upload:
             return
         if upload.file_size and upload.file_size > MAX_UPLOAD:
-            await message.answer("File exceeds 10 MB.")
+            await message.answer(f"File exceeds {MAX_UPLOAD_MB} MB.")
             return
         filename = "image.jpg" if message.photo else getattr(upload, "file_name", None)
         if not filename:
@@ -689,10 +706,11 @@ async def handle_file(message: types.Message):
         async with processing_slots:
             try:
                 file = await bot.get_file(upload.file_id)
-                stream = await bot.download_file(file.file_path)
+                stream = await bot.download_file(file.file_path, destination=UploadBuffer(), timeout=120)
                 data = stream.read(MAX_UPLOAD + 1)
+                stream.close()
                 if len(data) > MAX_UPLOAD:
-                    await message.answer("File exceeds 10 MB.")
+                    await message.answer(f"File exceeds {MAX_UPLOAD_MB} MB.")
                     return
                 if filename.lower().endswith(TEXT_EXTENSIONS) and len(data) > 512 * 1024:
                     await message.answer("Text file exceeds 512 KB.")
@@ -703,6 +721,8 @@ async def handle_file(message: types.Message):
                 level = automatic_intensity(level)
                 result, recipe, artifact, notices, filename = await process_upload(
                     data, filename, level, history, enabled)
+                if len(result) > MAX_OUTPUT:
+                    raise ContentLimitError(f"Result exceeds {MAX_OUTPUT // (1024 * 1024)} MB.")
                 await message.reply_document(
                     BufferedInputFile(result, filename="glitched_" + filename),
                 )
