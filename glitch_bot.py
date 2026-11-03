@@ -15,7 +15,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 import aiohttp
 
-from artifact_memory import ArtifactMemory, open_image
+from artifact_memory import configured_memory, open_image
 from language_glitch import Translator, TEXT_EXTENSIONS, decode_text, read_regions
 from memory_effects import inherit_image, inherit_bytes, glitch_text
 from image_agents import agent_canvas
@@ -44,8 +44,8 @@ class UploadBuffer(BytesIO):
 bot = make_bot(BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 
-# Sender-local history survives restarts; repeats bias the lottery without locking it.
-memory = ArtifactMemory(os.getenv("MEMORY_DB", "data/artifacts.sqlite3"))
+# Sender-local history; remote storage can survive free-host restarts.
+memory = configured_memory()
 translator = Translator(os.getenv("TRANSLATE_URL", ""), os.getenv("TRANSLATE_API_KEY", ""),
                         [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()])
 processing_slots = asyncio.Semaphore(2)

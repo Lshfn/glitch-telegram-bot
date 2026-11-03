@@ -66,6 +66,7 @@ def run_content_job(data, extension, level, artifacts):
                   "artifacts": [pack_artifact(a) for a in artifacts]}
         (root / "job.json").write_text(json.dumps(config), encoding="utf-8")
         env = dict(os.environ, BOT_TOKEN="", MEMORY_DB=str(root / "worker.sqlite3"),
+                   TURSO_DATABASE_URL="", TURSO_AUTH_TOKEN="",
                    OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
                    MALLOC_ARENA_MAX="2")
         command = [sys.executable, str(Path(__file__).with_name("format_worker.py")), str(root)]

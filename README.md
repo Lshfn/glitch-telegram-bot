@@ -133,11 +133,39 @@ new uploads supply the separate original and transformed thumbnails.
 
 The optional `/forget` command clears that history, intensity and translation
 preference, with a brief acknowledgement. It is not advertised in a bot menu.
-Storage is SQLite at `data/artifacts.sqlite3` (override `MEMORY_DB`). Place it on
-a persistent volume to retain memory across deploys. Render's free ephemeral
-filesystem loses memory on restart/redeploy; a paid disk is **not** provisioned
-by this project. Expiry is applied on access, not by a background task. Changing
-the retention setting cannot make an ephemeral filesystem durable.
+Without cloud credentials, storage is SQLite at `data/artifacts.sqlite3`
+(override `MEMORY_DB`). Render's free ephemeral filesystem loses this local
+archive on restart/redeploy. Changing the retention setting alone cannot retain
+files on an ephemeral filesystem. Expiry is applied on access, not by a background task.
+
+### Free persistent memory on Render
+
+Keep the bot on **Render Free** and use a **Turso Free libSQL database** for the
+archive. Turso currently offers 5 GB of free database storage with no credit card
+required: see [current pricing](https://turso.tech/pricing). This project does not
+provision paid services or enable overage billing. Keep the provider account on
+its Free plan and do not enable paid overages.
+
+1. Create a free Turso account and a **libSQL** database. The current adapter uses
+   the `libsql` driver, not the newer Turso rewrite engine.
+2. Add `TURSO_DATABASE_URL` (`libsql://…`) and `TURSO_AUTH_TOKEN` privately in the
+   existing Render service's Environment settings. See
+   [Turso's Python setup](https://docs.turso.tech/sdk/python/quickstart).
+3. Deploy the bot with those two settings. It writes directly to the remote
+   database; the archive no longer depends on Render's local filesystem.
+
+Only the bounded traces described above go into that database. Original files
+and filenames are not retained. The same sender/chat isolation, expiry, random
+selection and `/forget` deletion apply to both backends. Keep the database token
+out of source code, bot messages and public configuration. Decoder workers do
+not receive cloud credentials.
+
+Both settings are required together. Invalid credentials, network outages or
+provider quota limits cause an error instead of silently switching to disposable
+local memory. Free quotas still limit storage and activity; monitor them in the
+provider dashboard. No live Turso database is created or connected by this repo.
+Switching to a new database does not automatically copy any existing local
+archive, and files already lost during earlier Render restarts cannot be recovered.
 
 Owner settings in `.env.example` are `MEMORY_DAYS=180`,
 `MEMORY_PER_HISTORY=512`, `MEMORY_TOTAL=8192`, and `MEMORY_DONORS=16` (maximum 32).

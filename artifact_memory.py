@@ -1,6 +1,7 @@
 """Bounded, chat-local traces of previous uploads. Never store original files."""
 import hashlib
 import json
+import os
 import random
 import sqlite3
 import time
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from threading import RLock
+from urllib.parse import urlparse
 
 from PIL import Image, ImageOps
 from bot_settings import MEMORY_DAYS, MEMORY_PER_HISTORY, MEMORY_TOTAL, MEMORY_DONORS
@@ -59,11 +61,22 @@ def extract_artifact(data, text="", image=False):
 
 class ArtifactMemory:
     def __init__(self, path, per_chat=MEMORY_PER_HISTORY, total=MEMORY_TOTAL,
-                 ttl=MEMORY_DAYS * 86400, sample_size=MEMORY_DONORS):
+                 ttl=MEMORY_DAYS * 86400, sample_size=MEMORY_DONORS,
+                 remote_url="", auth_token=""):
         if min(per_chat, total, ttl, sample_size) <= 0:
             raise ValueError("Memory limits must be positive")
+        if bool(remote_url) != bool(auth_token):
+            raise ValueError("Turso memory requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN")
+        if remote_url:
+            parsed = urlparse(remote_url)
+            if (parsed.scheme not in ("libsql", "https") or not parsed.hostname or
+                    parsed.username or parsed.password or parsed.query or parsed.fragment or
+                    parsed.path not in ("", "/")):
+                raise ValueError("TURSO_DATABASE_URL must be a libSQL or HTTPS database URL without credentials")
         self.path = str(path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.remote_url, self.auth_token = remote_url, auth_token
+        if not remote_url:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.per_chat, self.total, self.ttl = per_chat, total, ttl
         self.sample_size = sample_size
         self.lock = RLock()
@@ -78,7 +91,7 @@ class ArtifactMemory:
                     touched REAL NOT NULL);
             """)
             # Upgrade existing histories in place; the old effects remain donors.
-            columns = {row[1] for row in db.execute("PRAGMA table_info(artifacts)")}
+            columns = {row[1] for row in db.execute("PRAGMA table_info(artifacts)").fetchall()}
             if "signal" not in columns:
                 db.execute("ALTER TABLE artifacts ADD COLUMN signal BLOB NOT NULL DEFAULT X''")
             if "original_image" not in columns:
@@ -97,7 +110,7 @@ class ArtifactMemory:
                 CREATE INDEX IF NOT EXISTS artifact_age ON artifacts(chat,created);
                 CREATE INDEX IF NOT EXISTS artifact_archive ON artifacts(priority);
             """)
-            columns = {row[1] for row in db.execute("PRAGMA table_info(preferences)")}
+            columns = {row[1] for row in db.execute("PRAGMA table_info(preferences)").fetchall()}
             if "mode" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN mode TEXT NOT NULL DEFAULT 'fuse'")
             if "chaos" not in columns:
@@ -105,9 +118,15 @@ class ArtifactMemory:
 
     @contextmanager
     def _db(self):
-        db = sqlite3.connect(self.path, timeout=10)
+        if self.remote_url:
+            import libsql
+            # The cloud database is authoritative; no ephemeral replica or delayed sync.
+            db = libsql.connect(self.remote_url, auth_token=self.auth_token, timeout=10)
+        else:
+            db = sqlite3.connect(self.path, timeout=10)
         try:
-            db.execute("PRAGMA secure_delete=ON")
+            if not self.remote_url:
+                db.execute("PRAGMA secure_delete=ON")
             with db:
                 yield db
         finally:
@@ -128,12 +147,12 @@ class ArtifactMemory:
             return
         recent_count = max(1, capacity // 4)
         recent = "SELECT rowid FROM artifacts" + where + " ORDER BY touched DESC,rowid DESC LIMIT ?"
-        kept = {row[0] for row in db.execute(recent, args + (recent_count,))}
+        kept = {row[0] for row in db.execute(recent, args + (recent_count,)).fetchall()}
         conjunction = " AND " if where else " WHERE "
         archive = ("SELECT rowid FROM artifacts" + where + conjunction + "rowid NOT IN (" + recent + ") "
                    "ORDER BY priority DESC,rowid DESC LIMIT ?")
-        kept.update(row[0] for row in db.execute(archive, args + args + (recent_count, capacity - recent_count)))
-        removed = [(rowid,) for (rowid,) in db.execute("SELECT rowid FROM artifacts" + where, args)
+        kept.update(row[0] for row in db.execute(archive, args + args + (recent_count, capacity - recent_count)).fetchall())
+        removed = [(rowid,) for (rowid,) in db.execute("SELECT rowid FROM artifacts" + where, args).fetchall()
                    if rowid not in kept]
         db.executemany("DELETE FROM artifacts WHERE rowid=?", removed)
 
@@ -182,12 +201,17 @@ class ArtifactMemory:
             now = time.time()
             selected = self._choose(candidates, now)
             artifacts = []
-            for key, _, _ in selected:
-                image, text, sample, signal, original = db.execute(
-                    "SELECT image,text,sample,signal,original_image FROM artifacts WHERE chat=? AND digest=?",
-                    (str(chat), key)).fetchone()
-                artifacts.append(Artifact(image, tuple(json.loads(text)), sample, signal, original))
-                db.execute("UPDATE artifacts SET recalled=? WHERE chat=? AND digest=?", (now, str(chat), key))
+            if selected:
+                keys = tuple(row[0] for row in selected)
+                placeholders = ",".join("?" for _ in keys)
+                rows = db.execute("SELECT digest,image,text,sample,signal,original_image FROM artifacts "
+                                  "WHERE chat=? AND digest IN (" + placeholders + ")",
+                                  (str(chat),) + keys).fetchall()
+                by_key = {key: Artifact(image, tuple(json.loads(text)), sample, signal, original)
+                          for key, image, text, sample, signal, original in rows}
+                artifacts = [by_key[key] for key in keys]
+                db.execute("UPDATE artifacts SET recalled=? WHERE chat=? AND digest IN (" + placeholders + ")",
+                           (now, str(chat)) + keys)
         return min(12, (row[0] if row else 0) + 1), artifacts
 
     def remember(self, chat, digest, level, artifact):
@@ -237,3 +261,10 @@ class ArtifactMemory:
         with self.lock, self._db() as db:
             db.execute("DELETE FROM artifacts WHERE chat=?", (str(chat),))
             db.execute("DELETE FROM preferences WHERE chat=?", (str(chat),))
+
+
+def configured_memory():
+    """Only explicit owner credentials enable remote persistence."""
+    return ArtifactMemory(os.getenv("MEMORY_DB", "data/artifacts.sqlite3"),
+                          remote_url=os.getenv("TURSO_DATABASE_URL", "").strip(),
+                          auth_token=os.getenv("TURSO_AUTH_TOKEN", "").strip())
