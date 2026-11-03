@@ -36,27 +36,32 @@ def inherit_image(image, artifacts, strength, style=None):
                 break
     labels = []
     if sources:
+        automatic = style is None
         style = style or random.choices(AUTOMATIC_MEMORY_SURFACES, (4, 3, 2, 1))[0]
         if style in ("recursive", "recursive field"):
             sources = visual_donors(artifacts, prefer_original=False) or sources
         if style in MEMORY_SURFACES:
-            donor = ImageOps.fit(random.choice(sources), out.size, Image.Resampling.LANCZOS)
-            if style == "texture graft":
-                radius = max(1, min(out.size) * .035)
-                color = np.asarray(out.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32)
-                donor_color = np.asarray(donor.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32)
-                pixels = np.asarray(donor, dtype=np.float32) + (color - donor_color) * .8
-                donor = Image.fromarray(np.clip(pixels, 0, 255).astype("uint8"))
-            elif style == "channel haunt":
-                channels = list(out.split())
-                donor_channels = donor.split()
-                changed = [c for c in range(3) if ImageChops.difference(channels[c], donor_channels[c]).getbbox()]
-                c = random.choice(changed or list(range(3)))
-                channels[c] = donor_channels[c]
-                donor = Image.merge("RGB", channels)
-            mask = content_mask(out, donor, random.uniform(.22, .52))
-            opacity = random.uniform(.35, .6) if style == "ghost field" else random.uniform(.65, .95)
-            out = multiscale_blend(out, donor, mask, opacity)
+            count = min(len(sources), random.choices((1, 2, 3), (2, 5, 3))[0]) if automatic else 1
+            for remembered in random.sample(sources, count):
+                layer_style = random.choices(AUTOMATIC_MEMORY_SURFACES, (4, 3, 2, 1))[0] if automatic else style
+                donor = ImageOps.fit(remembered, out.size, Image.Resampling.LANCZOS)
+                if layer_style == "texture graft":
+                    radius = max(1, min(out.size) * .035)
+                    color = np.asarray(out.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32)
+                    donor_color = np.asarray(donor.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32)
+                    pixels = np.asarray(donor, dtype=np.float32) + (color - donor_color) * .8
+                    donor = Image.fromarray(np.clip(pixels, 0, 255).astype("uint8"))
+                elif layer_style == "channel haunt":
+                    channels = list(out.split())
+                    donor_channels = donor.split()
+                    changed = [c for c in range(3) if ImageChops.difference(channels[c], donor_channels[c]).getbbox()]
+                    c = random.choice(changed or list(range(3)))
+                    channels[c] = donor_channels[c]
+                    donor = Image.merge("RGB", channels)
+                mask = content_mask(out, donor, random.uniform(.22, .52) / count ** .5)
+                opacity = random.uniform(.35, .6) if layer_style == "ghost field" else random.uniform(.65, .95)
+                out = multiscale_blend(out, donor, mask, opacity)
+                labels.append("inherited " + layer_style)
         for _ in range(0 if style in MEMORY_SURFACES else random.randint(1, 2 + int(strength > .65))):
             donor = random.choice(sources)
             # Crop a substantial region, then resize at one scale on both axes.
@@ -88,7 +93,8 @@ def inherit_image(image, artifacts, strength, style=None):
             elif style == "fragment":
                 mask = detail_mask(base, crop, .65)
             out.paste(crop, (x, y), mask)
-        labels.append("inherited " + style)
+        if style not in MEMORY_SURFACES:
+            labels.append("inherited " + style)
     snippets = [t for a in artifacts for t in a.text]
     if snippets and (not sources or random.random() < .55):
         draw = ImageDraw.Draw(out)

@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import RLock
 
 from PIL import Image, ImageOps
+from bot_settings import MEMORY_DAYS, MEMORY_PER_HISTORY, MEMORY_TOTAL, MEMORY_DONORS
 
 
 @dataclass(frozen=True)
@@ -57,10 +58,14 @@ def extract_artifact(data, text="", image=False):
 
 
 class ArtifactMemory:
-    def __init__(self, path, per_chat=24, total=256, ttl=7 * 86400):
+    def __init__(self, path, per_chat=MEMORY_PER_HISTORY, total=MEMORY_TOTAL,
+                 ttl=MEMORY_DAYS * 86400, sample_size=MEMORY_DONORS):
+        if min(per_chat, total, ttl, sample_size) <= 0:
+            raise ValueError("Memory limits must be positive")
         self.path = str(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.per_chat, self.total, self.ttl = per_chat, total, ttl
+        self.sample_size = sample_size
         self.lock = RLock()
         with self._db() as db:
             db.executescript("""
@@ -78,6 +83,20 @@ class ArtifactMemory:
                 db.execute("ALTER TABLE artifacts ADD COLUMN signal BLOB NOT NULL DEFAULT X''")
             if "original_image" not in columns:
                 db.execute("ALTER TABLE artifacts ADD COLUMN original_image BLOB NOT NULL DEFAULT X''")
+            if "created" not in columns:
+                db.execute("ALTER TABLE artifacts ADD COLUMN created REAL NOT NULL DEFAULT 0")
+                db.execute("UPDATE artifacts SET created=touched")
+            if "priority" not in columns:
+                db.execute("ALTER TABLE artifacts ADD COLUMN priority REAL NOT NULL DEFAULT 0")
+                for (rowid,) in db.execute("SELECT rowid FROM artifacts").fetchall():
+                    db.execute("UPDATE artifacts SET priority=? WHERE rowid=?", (random.random(), rowid))
+            if "recalled" not in columns:
+                db.execute("ALTER TABLE artifacts ADD COLUMN recalled REAL NOT NULL DEFAULT 0")
+            db.executescript("""
+                CREATE INDEX IF NOT EXISTS artifact_chat_time ON artifacts(chat,touched);
+                CREATE INDEX IF NOT EXISTS artifact_age ON artifacts(chat,created);
+                CREATE INDEX IF NOT EXISTS artifact_archive ON artifacts(priority);
+            """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(preferences)")}
             if "mode" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN mode TEXT NOT NULL DEFAULT 'fuse'")
@@ -96,11 +115,54 @@ class ArtifactMemory:
 
     def _prune(self, db):
         db.execute("DELETE FROM artifacts WHERE touched < ?", (time.time() - self.ttl,))
-        db.execute("DELETE FROM artifacts WHERE rowid NOT IN "
-                   "(SELECT rowid FROM artifacts ORDER BY touched DESC LIMIT ?)", (self.total,))
+        self._trim(db, self.total)
         db.execute("DELETE FROM preferences WHERE touched < ?", (time.time() - self.ttl,))
         db.execute("DELETE FROM preferences WHERE rowid NOT IN "
                    "(SELECT rowid FROM preferences ORDER BY touched DESC LIMIT 512)")
+
+    @staticmethod
+    def _trim(db, capacity, chat=None):
+        """Keep a recent quarter plus a priority reservoir of older uploads."""
+        where, args = (" WHERE chat=?", (str(chat),)) if chat is not None else ("", ())
+        if db.execute("SELECT count(*) FROM artifacts" + where, args).fetchone()[0] <= capacity:
+            return
+        recent_count = max(1, capacity // 4)
+        recent = "SELECT rowid FROM artifacts" + where + " ORDER BY touched DESC,rowid DESC LIMIT ?"
+        kept = {row[0] for row in db.execute(recent, args + (recent_count,))}
+        conjunction = " AND " if where else " WHERE "
+        archive = ("SELECT rowid FROM artifacts" + where + conjunction + "rowid NOT IN (" + recent + ") "
+                   "ORDER BY priority DESC,rowid DESC LIMIT ?")
+        kept.update(row[0] for row in db.execute(archive, args + args + (recent_count, capacity - recent_count)))
+        removed = [(rowid,) for (rowid,) in db.execute("SELECT rowid FROM artifacts" + where, args)
+                   if rowid not in kept]
+        db.executemany("DELETE FROM artifacts WHERE rowid=?", removed)
+
+    def _choose(self, rows, now):
+        if len(rows) <= self.sample_size:
+            chosen = list(rows)
+            random.shuffle(chosen)
+            return chosen
+        quarter = max(1, len(rows) // 4)
+        groups = (rows[:quarter], rows[quarter:-quarter], rows[-quarter:])
+        counts = (self.sample_size // 4, self.sample_size // 4)
+        counts += (max(0, self.sample_size - sum(counts)),)
+        chosen = []
+
+        def draw(pool, count):
+            pool = list(pool)
+            for _ in range(min(count, len(pool))):
+                # Recently recalled files get a cooldown, without refreshing expiry.
+                weights = [.1 + min(1, max(0, now - row[2]) / 21600) for row in pool]
+                row = random.choices(pool, weights=weights)[0]
+                chosen.append(row)
+                pool.remove(row)
+
+        for group, count in zip(groups, counts):
+            draw(group, count)
+        ids = {row[0] for row in chosen}
+        draw([row for row in rows if row[0] not in ids], self.sample_size - len(chosen))
+        random.shuffle(chosen)
+        return chosen[:self.sample_size]
 
     @staticmethod
     def digest(data):
@@ -111,22 +173,35 @@ class ArtifactMemory:
             self._prune(db)
             row = db.execute("SELECT level FROM artifacts WHERE chat=? AND digest=?",
                              (str(chat), digest)).fetchone()
-            rows = db.execute("SELECT image,text,sample,signal,original_image FROM artifacts WHERE chat=? "
-                              "ORDER BY touched DESC LIMIT ?", (str(chat), self.per_chat)).fetchall()
-        return min(12, (row[0] if row else 0) + 1), [
-            Artifact(image, tuple(json.loads(text)), sample, signal, original)
-            for image, text, sample, signal, original in rows]
+            candidates = db.execute("SELECT digest,created,recalled FROM artifacts WHERE chat=? "
+                                    "AND digest<>? ORDER BY created DESC,touched DESC,rowid DESC",
+                                    (str(chat), digest)).fetchall()
+            if not candidates and row:
+                candidates = db.execute("SELECT digest,created,recalled FROM artifacts WHERE chat=? AND digest=?",
+                                        (str(chat), digest)).fetchall()
+            now = time.time()
+            selected = self._choose(candidates, now)
+            artifacts = []
+            for key, _, _ in selected:
+                image, text, sample, signal, original = db.execute(
+                    "SELECT image,text,sample,signal,original_image FROM artifacts WHERE chat=? AND digest=?",
+                    (str(chat), key)).fetchone()
+                artifacts.append(Artifact(image, tuple(json.loads(text)), sample, signal, original))
+                db.execute("UPDATE artifacts SET recalled=? WHERE chat=? AND digest=?", (now, str(chat), key))
+        return min(12, (row[0] if row else 0) + 1), artifacts
 
     def remember(self, chat, digest, level, artifact):
         with self.lock, self._db() as db:
-            db.execute("INSERT OR REPLACE INTO artifacts "
-                       "(chat,digest,touched,level,image,text,sample,signal,original_image) VALUES (?,?,?,?,?,?,?,?,?)",
-                       (str(chat), digest, time.time(), level, artifact.image,
+            now = time.time()
+            db.execute("INSERT INTO artifacts "
+                       "(chat,digest,touched,level,image,text,sample,signal,original_image,created,priority) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chat,digest) DO UPDATE SET "
+                       "touched=excluded.touched,level=excluded.level,image=excluded.image,text=excluded.text,"
+                       "sample=excluded.sample,signal=excluded.signal,original_image=excluded.original_image",
+                       (str(chat), digest, now, level, artifact.image,
                         json.dumps(artifact.text[:5], ensure_ascii=False), artifact.sample[:4096],
-                        artifact.signal[:4096], artifact.original_image))
-            db.execute("DELETE FROM artifacts WHERE chat=? AND rowid NOT IN "
-                       "(SELECT rowid FROM artifacts WHERE chat=? ORDER BY touched DESC LIMIT ?)",
-                       (str(chat), str(chat), self.per_chat))
+                        artifact.signal[:4096], artifact.original_image, now, random.random()))
+            self._trim(db, self.per_chat, chat)
             self._prune(db)
 
     def translations(self, chat, enabled=None):

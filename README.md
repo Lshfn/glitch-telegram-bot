@@ -67,7 +67,7 @@ animations and video notes are accepted as well as file attachments.
 | DOCX | Text runs in the body, tables, headers, footers, footnotes/endnotes; up to 12 embedded raster images | DOCX with run styling and package relationships retained |
 | PDF | Every page, extracted text, page contact sheet, file-byte projection | Raster PDF with the same page count; selectable text, links and forms are flattened |
 | WAV, MP3, OGG/Opus, FLAC, M4A, AAC, AIFF | Decoded waveform, waveform drawing, file-byte projection | Stereo 22.05 kHz, 16-bit PCM WAV |
-| MP4, MOV, MKV, WebM, AVI, GIF | Decoded frames, contact sheet, any audio, temporal feedback | H.264 MP4 at 8 fps, up to 480 px; audio becomes AAC |
+| MP4, MOV, MKV, WebM, AVI, GIF | Decoded frames, contact sheet, any audio, temporal feedback | H.264 MP4 with adaptive frame rate, up to 480 px; audio becomes AAC |
 | Other files | Payload bytes and earlier content projections | Same extension; intentionally destructive |
 
 The additional mathematical variations include:
@@ -106,8 +106,21 @@ remains available internally to the engine; users do not choose processing modes
 ## Memory
 
 Histories belong to **one sender in one chat**. Nothing crosses between users or
-chats. The bot remembers traces of up to 24 distinct recent uploads per history,
-256 uploads in total, for seven days; repeated content updates its existing entry.
+chats. The default archive holds up to **512 distinct file traces per history**,
+8192 in total, for **180 days since the last upload of that content**. Repeated
+content updates its entry while retaining its original arrival time and archive
+priority. Recalling an old file does not reset its expiry.
+
+A quarter of the capacity is reserved for recent uploads. The rest is a random
+priority reservoir, so new uploads do not simply push every older file out. Each
+render receives at most 16 traces: roughly a quarter from the recent part of the
+history, a quarter from the middle and half from its oldest part. Recently
+recalled files have reduced selection weight for six hours. The actual upload
+is excluded from donor selection when other memories exist. Only the selected
+traces are loaded into the worker, even when the archive holds hundreds.
+
+Image memory can combine one to three distinct earlier images, with independently
+selected blending styles and smaller regions when several layers are used.
 Only two small re-encoded thumbnails/contact sheets (original and transformed,
 each up to 320 px), up to five text excerpts, up to
 4 KB of payload fragments and up to 4 KB of projected content signals are
@@ -123,7 +136,12 @@ preference, with a brief acknowledgement. It is not advertised in a bot menu.
 Storage is SQLite at `data/artifacts.sqlite3` (override `MEMORY_DB`). Place it on
 a persistent volume to retain memory across deploys. Render's free ephemeral
 filesystem loses memory on restart/redeploy; a paid disk is **not** provisioned
-by this project. Seven-day expiry is applied on access, not by a background task.
+by this project. Expiry is applied on access, not by a background task. Changing
+the retention setting cannot make an ephemeral filesystem durable.
+
+Owner settings in `.env.example` are `MEMORY_DAYS=180`,
+`MEMORY_PER_HISTORY=512`, `MEMORY_TOTAL=8192`, and `MEMORY_DONORS=16` (maximum 32).
+See [Render's storage limitations](https://render.com/docs/free#local-files-lost-on-redeploy).
 
 ## Random translations
 
@@ -157,7 +175,7 @@ small or rotated text. A flat local background approximates erased text, rather
 than reconstructing the original scene. Unsupported fonts/languages can require
 installing a suitable font and setting `GLITCH_FONT` to its path. The Docker image
 includes Noto Sans for the default target scripts. Provider failures/timeouts are
-reported in the output caption and do not stop ordinary glitches.
+recorded in server logs and do not stop ordinary glitches.
 
 ## Run and deploy
 
@@ -171,21 +189,53 @@ The Dockerfile includes OCR, fonts, FFmpeg and Poppler. Build with
 `docker build -t glitch-bot .`, then run with
 `docker run --env-file .env -v glitch-memory:/app/data glitch-bot`.
 Keep `.env` out of git. Add `BOT_TOKEN`, `TRANSLATE_URL`, and any optional
-`TRANSLATE_API_KEY` there. Uploads are limited to 10 MB, text files to 512 KB,
+`TRANSLATE_API_KEY` there. Cloud-API uploads are limited to 20 MB, text files to 512 KB,
 images to 12 megapixels and processing resolution to 1600 px on the longest edge.
 Heavy processing runs off the event loop; at most two uploads run concurrently,
 with ordered processing within each sender/chat history. Only one document/media
-worker runs at a time. Workers have a 60-second wall deadline, a 45-second CPU
+worker runs at a time. Workers have a 240-second wall deadline, a 180-second CPU
 budget and a 1 GB virtual address-space limit (including decoder libraries);
 their decoder subprocesses inherit the
 limits and are killed with the worker on timeout. Use Docker on other platforms.
 
-Content-mode limits are 12 PDF pages, 60 seconds of audio, 12 seconds of video,
-32 MB of expanded DOCX data, 128K DOCX text characters, 4000 DOCX paragraphs,
-16K characters per DOCX paragraph, 256 KB of extracted PDF text and 16 MB per
-output. Video input frames may contain at most 12 megapixels. Longer/larger files
-must be shortened/split first or sent in `/mode raw`. Limits bound processing;
-chaos intensity controls the transformations within them.
+Default processing limits are:
+
+| Limit | Default |
+| --- | --- |
+| Input via Telegram's public Bot API | 20 MB |
+| Input via a configured local Bot API server | 100 MB |
+| PDF | 100 pages; 2 MB of extracted text |
+| Video | 120 seconds, at most 320 processing frames |
+| Audio | 180 seconds |
+| Output | 48 MB on the public API; 100 MB on the configured local server |
+
+Short videos keep up to 8 fps. Long videos reduce their frame rate to fit the
+processing budget (2 fps at the 120-second default maximum). Video resolution is
+up to 480 px, or 384 px for clips longer than 30 seconds. Small source frames are
+not enlarged. The full timeline and audio are retained. PDF pages are processed
+individually and merged with Poppler, without keeping every full page in RAM.
+Large file bytes are projected in small chunks for cross-file mathematics.
+
+The owner can adjust `MAX_UPLOAD_MB`, `MAX_OUTPUT_MB`, `MAX_PDF_PAGES`,
+`MAX_VIDEO_SECONDS` and `MAX_AUDIO_SECONDS` within the validated ranges. Worker
+resource limits still apply. The existing DOCX expansion/text limits (32 MB,
+128K characters, 4000 paragraphs and 16K per paragraph) and 12-megapixel image
+and video-input frame limits remain.
+
+### Files above the public Telegram API limit
+
+Telegram's public `getFile` endpoint only downloads files up to 20 MB. Larger
+uploads require a separately hosted [Telegram Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server),
+running with `--local`. The bot supports this through `BOT_API_URL` and
+`BOT_API_LOCAL_FILES=true`. Mount the API server's files directory at the same
+absolute paths in the bot container; aiogram then reads those local files.
+Input/output limits default to 100 MB with that endpoint configured. Downloads
+are bounded while they stream, including when Telegram does not supply file size.
+
+Follow Telegram's [migration procedure](https://core.telegram.org/bots/features#local-bot-api),
+including cloud `logOut`, before moving an active bot. No API server is started,
+no logout is performed, and no existing hosted service is reconfigured by this
+code. The default remains Telegram's public API.
 
 ### Existing Render service
 
@@ -210,7 +260,9 @@ reopened DOCX/PDF/WAV files, MP4 video and audio decoding, resource limits, the
 destructive fallback, automatic intensity and routing, silent file replies,
 command-menu cleanup, failed delivery, translation HTTP
 requests/failures, recognisable memory proportions, intact/processed thumbnail
-migration, local editing agents, image-guided masks and multiscale memory,
+migration, historical archive retention and random age mixing, multiple memory
+layers, bounded downloads, local Bot API file reads, larger PDF/video/audio,
+local editing agents, image-guided masks and multiscale memory,
 automatic exclusion of strip/cutout effects, motion feedback,
 actual codec I-frame removal and frame-count preservation, and real local OCR
 when Tesseract is installed. Fixtures are
