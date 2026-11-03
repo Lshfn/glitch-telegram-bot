@@ -163,7 +163,10 @@ not receive cloud credentials.
 Both settings are required together. Invalid credentials, network outages or
 provider quota limits cause an error instead of silently switching to disposable
 local memory. Free quotas still limit storage and activity; monitor them in the
-provider dashboard. No live Turso database is created or connected by this repo.
+provider dashboard. Turso's [unarchive API documentation](https://docs.turso.tech/api-reference/groups/unarchive)
+also describes free databases being archived after 10 days of inactivity;
+after a long break, an owner may need to unarchive the database before the bot
+can use it again. No live Turso database is created or connected by this repo.
 Switching to a new database does not automatically copy any existing local
 archive, and files already lost during earlier Render restarts cannot be recovered.
 
