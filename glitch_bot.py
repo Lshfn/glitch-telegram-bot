@@ -4,6 +4,7 @@ import asyncio
 import math
 import logging
 import weakref
+from contextlib import suppress
 from io import BytesIO
 
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
@@ -11,6 +12,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import BufferedInputFile
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 import aiohttp
@@ -23,6 +25,10 @@ from image_surfaces import content_mask
 from content_fusion import trace, merge_traces, fuse_image, fuse_text, fuse_bytes
 from file_formats import CONTENT_EXTENSIONS, ContentLimitError, ContentUnavailable, run_content_job
 from bot_settings import MAX_UPLOAD, MAX_UPLOAD_MB, MAX_OUTPUT, BOT_API_URL, BOT_API_LOCAL_FILES
+from bot_settings import MEMORY_DREAMS
+from memory_dreams import make_dream
+from dream_auth import authorize_dream_tick
+from jwt import PyJWTError
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -50,6 +56,7 @@ translator = Translator(os.getenv("TRANSLATE_URL", ""), os.getenv("TRANSLATE_API
                         [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()])
 processing_slots = asyncio.Semaphore(2)
 content_slots = asyncio.Semaphore(1)
+dream_dispatch_lock = asyncio.Lock()
 chat_locks = weakref.WeakValueDictionary()
 logger = logging.getLogger(__name__)
 
@@ -679,6 +686,12 @@ async def handle_file(message: types.Message):
             await asyncio.to_thread(memory.forget, scope)
             await message.answer("Memory cleared.")
             return
+        if action == "/dreams":
+            option = command[1].lower() if len(command) > 1 else ""
+            if getattr(message.chat, "type", "") == "private" and option in ("on", "off"):
+                await asyncio.to_thread(memory.schedule_dream, scope, option == "on")
+                await message.answer("✶")
+            return
         if action == "/translate":
             option = command[1].lower() if len(command) > 1 else ""
             if option not in ("on", "off"):
@@ -728,6 +741,8 @@ async def handle_file(message: types.Message):
                 )
                 # Failed processing/delivery never becomes a donor for later files.
                 await asyncio.to_thread(memory.remember, scope, digest, level, artifact)
+                if MEMORY_DREAMS and getattr(message.chat, "type", "") == "private":
+                    await asyncio.to_thread(memory.schedule_dream, scope)
                 logger.info("Glitch level=%s effects=%s", level, recipe)
                 for notice in notices:
                     logger.info("Processing notice: %s", notice)
@@ -746,6 +761,78 @@ async def handle_file(message: types.Message):
 # START / DEPLOYMENT
 # ---------------------------------------------------------------------------
 WEBHOOK_PATH = "/telegram-webhook"
+
+
+async def send_due_dreams():
+    if not MEMORY_DREAMS or bot is None or dream_dispatch_lock.locked():
+        return 0
+    sent = 0
+    async with dream_dispatch_lock:
+        claims = await asyncio.to_thread(memory.claim_dreams)
+        for scope, token in claims:
+            delivered, blocked, retry_after = False, False, 0
+            async with chat_lock(scope):
+                try:
+                    async with processing_slots:
+                        _, artifacts = await asyncio.to_thread(memory.snapshot, scope, "")
+                        if len(artifacts) < 2:
+                            continue
+                        data, filename = await asyncio.to_thread(make_dream, artifacts)
+                        if len(data) > MAX_OUTPUT:
+                            raise ContentLimitError("Memory mix exceeds the output limit")
+                        if not await asyncio.to_thread(memory.dream_allowed, scope, token):
+                            continue
+                        await bot.send_document(chat_id=memory.private_recipient(scope),
+                                                document=BufferedInputFile(data, filename=filename))
+                        delivered = True
+                        sent += 1
+                except TelegramForbiddenError:
+                    blocked = True
+                except TelegramRetryAfter as exc:
+                    retry_after = exc.retry_after
+                except TelegramBadRequest as exc:
+                    blocked = any(value in exc.message.lower() for value in ("chat not found", "user is deactivated"))
+                    logger.warning("Memory mix delivery failed: %s", type(exc).__name__)
+                except Exception as exc:
+                    logger.warning("Memory mix failed: %s", type(exc).__name__)
+                finally:
+                    await asyncio.to_thread(memory.finish_dream, scope, token, delivered, blocked, retry_after)
+    return sent
+
+
+async def dream_loop():
+    while True:
+        try:
+            await send_due_dreams()
+        except Exception as exc:
+            logger.warning("Memory scheduler unavailable: %s", type(exc).__name__)
+        await asyncio.sleep(60)
+
+
+async def dream_lifecycle(app):
+    task = asyncio.create_task(dream_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def memory_tick(request):
+    # No recipient, file or timing parameters can be supplied by the caller.
+    # GitHub signs a short-lived identity for this exact main-branch workflow.
+    origin = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    try:
+        await asyncio.to_thread(authorize_dream_tick, request.headers.get("Authorization", ""), origin)
+    except (PyJWTError, ValueError):
+        return web.Response(status=403, text="Forbidden")
+    try:
+        await send_due_dreams()
+    except Exception as exc:
+        logger.warning("Scheduled memory check failed: %s", type(exc).__name__)
+        return web.Response(status=503, text="Memory unavailable")
+    return web.Response(text="Memory check completed")
 
 
 async def healthcheck(request):
@@ -775,6 +862,7 @@ async def on_render_startup(bot: Bot):
         drop_pending_updates=False,
     )
     print(f"GLITCH BOT WEBHOOK ACTIVE: {webhook_url}")
+    logger.info("Memory storage backend=%s", "remote" if memory.remote_url else "local")
 
 
 async def run_local_polling():
@@ -783,7 +871,13 @@ async def run_local_polling():
     await bot.delete_webhook(drop_pending_updates=False)
     await clear_command_menu(bot)
     print("GLITCH BOT STARTED IN LOCAL POLLING MODE")
-    await dp.start_polling(bot)
+    task = asyncio.create_task(dream_loop())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def run_render_webhook():
@@ -791,8 +885,10 @@ def run_render_webhook():
     dp.startup.register(on_render_startup)
 
     app = web.Application()
+    app.cleanup_ctx.append(dream_lifecycle)
     app.router.add_get("/", healthcheck)
     app.router.add_get("/health", healthcheck)
+    app.router.add_post("/memory-tick", memory_tick)
 
     SimpleRequestHandler(
         dispatcher=dp,

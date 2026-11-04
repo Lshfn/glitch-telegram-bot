@@ -42,3 +42,7 @@ MEMORY_DAYS = integer("MEMORY_DAYS", 180, maximum=3650)
 MEMORY_PER_HISTORY = integer("MEMORY_PER_HISTORY", 512)
 MEMORY_TOTAL = integer("MEMORY_TOTAL", 8192)
 MEMORY_DONORS = integer("MEMORY_DONORS", 16, maximum=32)
+
+MEMORY_DREAMS = os.getenv("MEMORY_DREAMS", "true").lower() in ("1", "true", "yes")
+DREAM_MIN_HOURS = integer("DREAM_MIN_HOURS", 6, maximum=168)
+DREAM_MAX_HOURS = integer("DREAM_MAX_HOURS", 30, minimum=DREAM_MIN_HOURS, maximum=336)

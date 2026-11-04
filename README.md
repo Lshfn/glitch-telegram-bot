@@ -174,6 +174,53 @@ Owner settings in `.env.example` are `MEMORY_DAYS=180`,
 `MEMORY_PER_HISTORY=512`, `MEMORY_TOTAL=8192`, and `MEMORY_DONORS=16` (maximum 32).
 See [Render's storage limitations](https://render.com/docs/free#local-files-lost-on-redeploy).
 
+## Spontaneous memory files
+
+After a successful upload in a private chat, the bot starts an independent
+random timer. Once that history has at least two distinct remembered files,
+it can send a new mix without another upload. Each attempted delivery chooses
+the next interval uniformly between 6 and 30 hours. New uploads do not keep
+resetting an existing timer. Earlier private histories are enrolled on their
+next successful upload; groups and channels are never enrolled.
+
+The mix uses only that sender/chat's age-mixed donor pool. It can become a PNG,
+one-page PDF, UTF-8 text file, or a 6–12 second stereo WAV. Images inherit
+recognizable thumbnails and content-guided blending; text reweaves remembered
+phrases; sound is synthesized from stored content projections, not recovered
+recordings. No complete old file is retained or re-sent. Generated files are
+not added back to the archive, and spontaneous files have no technical caption.
+
+`/dreams off` stops these sends; `/dreams on` resumes them with a fresh random
+delay. Both controls remain outside the bot's menu. `/forget` deletes the history
+and cancels its timer. A blocked bot disables that chat's timer. Failed or
+interrupted sends skip that turn: a due attempt is reserved in the database
+before rendering, so a restart or overlapping worker does not replay it.
+Overdue intervals are not sent as a catch-up burst.
+
+An in-process task checks once a minute while the app is running. Because
+[Render Free sleeps after 15 idle minutes](https://render.com/docs/free),
+`.github/workflows/memory-dreams.yml` also wakes the existing service hourly and
+calls `/memory-tick`. It uses a short-lived, GitHub-signed OIDC token. The bot
+verifies its signature, audience, issuer, expiry, immutable repository/owner IDs,
+main branch, workflow path and event type. The endpoint accepts no recipient or
+file parameters. Neither Telegram nor Turso secrets need to be copied to GitHub.
+The workflow uses the standard Ubuntu runner, which is
+[free for this public repository](https://docs.github.com/en/billing/concepts/product-billing/github-actions).
+It checks real scheduled work and allows Render to sleep between runs.
+
+**Connect Turso before relying on spontaneous sends on Render Free.** Timers and
+memories use the same database. Local SQLite disappears when the free instance
+sleeps. GitHub schedules can be delayed or dropped and, for public repositories,
+can be disabled after 60 days of repository inactivity; sending times are
+approximate. See [GitHub's schedule limitations](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+Keep the workflow enabled and provider usage within their free allowances.
+
+Owner settings: `MEMORY_DREAMS=true`, `DREAM_MIN_HOURS=6`, `DREAM_MAX_HOURS=30`.
+Setting `MEMORY_DREAMS=false` stops all spontaneous sends; disable the GitHub
+workflow too if hourly checks are no longer needed. The workflow's service URL
+and `dream_auth.py` trust policy target this repository and Render service;
+forks must deliberately configure their own identity and destination.
+
 ## Random translations
 
 Set `TRANSLATE_URL` to the root URL of a LibreTranslate-compatible service, e.g.

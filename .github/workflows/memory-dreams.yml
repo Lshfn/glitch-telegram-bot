@@ -1,0 +1,44 @@
+name: Spontaneous memory files
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+permissions:
+  id-token: write
+concurrency:
+  group: memory-dreams
+  cancel-in-progress: false
+jobs:
+  check-due-files:
+    if: github.repository == 'Lshfn/glitch-telegram-bot' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Wake the free service and check due memories
+        env:
+          BOT_ORIGIN: https://glitch-telegram-bot.onrender.com
+        run: |
+          python3 - <<'PY'
+          import json, os, time
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+          origin = os.environ['BOT_ORIGIN']
+          for attempt in range(3):
+              try:
+                  request = Request(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + quote(origin, safe=''),
+                                    headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+                  with urlopen(request, timeout=20) as response:
+                      token = json.load(response)['value']
+                  request = Request(origin + '/memory-tick', data=b'', method='POST',
+                                    headers={'Authorization': 'Bearer ' + token})
+                  with urlopen(request, timeout=90) as response:
+                      if response.status != 200 or response.read(1000).strip() != b'Memory check completed':
+                          raise RuntimeError('Service is not ready')
+                  break
+              except (HTTPError, URLError, TimeoutError, RuntimeError):
+                  if attempt == 2:
+                      raise RuntimeError('Memory check unavailable') from None
+                  time.sleep(10)
+          print('Memory check completed.')
+          PY
