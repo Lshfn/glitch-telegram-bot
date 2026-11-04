@@ -6,3 +6,4 @@ pytesseract==0.3.13
 numpy>=2.2,<3
 lxml>=5,<7
 libsql==0.1.11
+PyJWT[crypto]>=2.10,<3

@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import random
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -13,7 +14,8 @@ from threading import RLock
 from urllib.parse import urlparse
 
 from PIL import Image, ImageOps
-from bot_settings import MEMORY_DAYS, MEMORY_PER_HISTORY, MEMORY_TOTAL, MEMORY_DONORS
+from bot_settings import (MEMORY_DAYS, MEMORY_PER_HISTORY, MEMORY_TOTAL, MEMORY_DONORS,
+                          DREAM_MIN_HOURS, DREAM_MAX_HOURS)
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,11 @@ class ArtifactMemory:
                 CREATE TABLE IF NOT EXISTS preferences (
                     chat TEXT PRIMARY KEY, translate_enabled INTEGER NOT NULL,
                     touched REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS memory_dreams (
+                    chat TEXT PRIMARY KEY, enabled INTEGER NOT NULL,
+                    next_at REAL NOT NULL, touched REAL NOT NULL,
+                    claim TEXT NOT NULL DEFAULT '', last_sent REAL NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS dream_due ON memory_dreams(enabled,next_at);
             """)
             # Upgrade existing histories in place; the old effects remain donors.
             columns = {row[1] for row in db.execute("PRAGMA table_info(artifacts)").fetchall()}
@@ -138,6 +145,9 @@ class ArtifactMemory:
         db.execute("DELETE FROM preferences WHERE touched < ?", (time.time() - self.ttl,))
         db.execute("DELETE FROM preferences WHERE rowid NOT IN "
                    "(SELECT rowid FROM preferences ORDER BY touched DESC LIMIT 512)")
+        db.execute("DELETE FROM memory_dreams WHERE touched < ?", (time.time() - self.ttl,))
+        db.execute("DELETE FROM memory_dreams WHERE rowid NOT IN "
+                   "(SELECT rowid FROM memory_dreams ORDER BY touched DESC LIMIT 512)")
 
     @staticmethod
     def _trim(db, capacity, chat=None):
@@ -261,6 +271,68 @@ class ArtifactMemory:
         with self.lock, self._db() as db:
             db.execute("DELETE FROM artifacts WHERE chat=?", (str(chat),))
             db.execute("DELETE FROM preferences WHERE chat=?", (str(chat),))
+            db.execute("DELETE FROM memory_dreams WHERE chat=?", (str(chat),))
+
+    @staticmethod
+    def private_recipient(scope):
+        parts = str(scope).split(":")
+        if len(parts) != 2 or parts[0] != parts[1] or not parts[0].isdigit() or int(parts[0]) <= 0:
+            raise ValueError("Spontaneous files require a sender's own private chat")
+        return int(parts[0])
+
+    @staticmethod
+    def dream_delay():
+        return random.uniform(DREAM_MIN_HOURS * 3600, DREAM_MAX_HOURS * 3600)
+
+    def schedule_dream(self, scope, enabled=None):
+        """Uploads enroll private chats, preserving an existing opt-out and due time."""
+        self.private_recipient(scope)
+        with self.lock, self._db() as db:
+            self._prune(db)
+            now = time.time()
+            db.execute("INSERT INTO memory_dreams(chat,enabled,next_at,touched) VALUES(?,?,?,?) "
+                       "ON CONFLICT(chat) DO UPDATE SET touched=excluded.touched",
+                       (str(scope), int(enabled is not False), now + self.dream_delay(), now))
+            if enabled is not None:
+                db.execute("UPDATE memory_dreams SET enabled=?,next_at=?,claim='' WHERE chat=?",
+                           (int(enabled), now + self.dream_delay(), str(scope)))
+
+    def claim_dreams(self, limit=4):
+        """Reserve each attempt before sending, including across overlapping processes.
+
+        A crash or lost Telegram response skips that turn rather than replaying it.
+        Missed intervals are not replayed in a burst after downtime.
+        """
+        with self.lock, self._db() as db:
+            self._prune(db)
+            now = time.time()
+            due = db.execute("SELECT chat FROM memory_dreams WHERE enabled=1 AND next_at<=? "
+                             "AND (SELECT count(*) FROM artifacts WHERE artifacts.chat=memory_dreams.chat)>=2 "
+                             "ORDER BY next_at LIMIT ?", (now, min(4, max(1, limit)))).fetchall()
+            claimed = []
+            for (scope,) in due:
+                self.private_recipient(scope)
+                token = secrets.token_hex(16)
+                rows = db.execute("UPDATE memory_dreams SET next_at=?,claim=? "
+                                  "WHERE chat=? AND enabled=1 AND next_at<=? RETURNING chat",
+                                  (now + self.dream_delay(), token, scope, now)).fetchall()
+                if rows:
+                    claimed.append((scope, token))
+            return claimed
+
+    def dream_allowed(self, scope, token):
+        with self.lock, self._db() as db:
+            return bool(db.execute("SELECT 1 FROM memory_dreams WHERE chat=? AND enabled=1 AND claim=? "
+                                   "AND (SELECT count(*) FROM artifacts WHERE chat=?)>=2",
+                                   (str(scope), token, str(scope))).fetchone())
+
+    def finish_dream(self, scope, token, delivered=False, blocked=False, retry_after=0):
+        with self.lock, self._db() as db:
+            now = time.time()
+            db.execute("UPDATE memory_dreams SET claim='',enabled=CASE WHEN ? THEN 0 ELSE enabled END,"
+                       "last_sent=CASE WHEN ? THEN ? ELSE last_sent END,next_at=max(next_at,?) "
+                       "WHERE chat=? AND claim=?",
+                       (int(blocked), int(delivered), now, now + max(0, retry_after), str(scope), token))
 
 
 def configured_memory():
