@@ -49,8 +49,10 @@ Selected image details resist their edits. Local pixel values can change an agen
 next tool and brush radius. This is a bounded adaptation of the tool-interaction
 idea; the reference images and implementation are not copied into the bot.
 
-There is no setup dialogue, processing command menu or technical caption on
-returned files. `/start` and `/help` reply with a single symbol. Other text is
+There is no setup dialogue or technical caption on returned files.
+`/start` and `/help` show every supported command with a short label:
+`/start`, `/help`, `/dreams on`, `/dreams off`, `/translate on`,
+`/translate off`, and `/forget`. Other text is
 ignored unless it is one of the optional memory/translation controls below.
 The old default Telegram command menu is cleared at startup in both webhook and
 polling deployments. Existing `/mode` and `/chaos` preferences are ignored.
@@ -191,7 +193,7 @@ recordings. No complete old file is retained or re-sent. Generated files are
 not added back to the archive, and spontaneous files have no technical caption.
 
 `/dreams off` stops these sends; `/dreams on` resumes them with a fresh random
-delay. Both controls remain outside the bot's menu. `/forget` deletes the history
+delay. Both controls are listed by `/start` and `/help`. `/forget` deletes the history
 and cancels its timer. A blocked bot disables that chat's timer. Failed or
 interrupted sends skip that turn: a due attempt is reserved in the database
 before rendering, so a restart or overlapping worker does not replay it.
@@ -234,7 +236,7 @@ selected snippets to the configured provider; images are OCR'd locally and only
 recognized text is sent, never the image itself. `/translate off` stops this.
 Translation is off by default; automatic processing does not enable it or change
 an existing opt-in. Without a service, memory effects still work. These controls
-are not advertised in a bot menu. Group members cannot enable translation for
+are listed by `/start` and `/help`. Group members cannot enable translation for
 each other's uploads.
 
 Each eligible upload selects a few phrases/lines and random target languages.

@@ -31,6 +31,15 @@ from dream_auth import authorize_dream_tick
 from jwt import PyJWTError
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+COMMAND_HELP = "\n".join((
+    "/start — commands",
+    "/help — commands",
+    "/dreams on — random mixes",
+    "/dreams off — stop mixes",
+    "/translate on — enable translation",
+    "/translate off — disable translation",
+    "/forget — clear memory",
+))
 
 def make_bot(token):
     options = {"timeout": 180}
@@ -680,7 +689,7 @@ async def handle_file(message: types.Message):
     action = command[0].split("@")[0].lower() if command else ""
     async with chat_lock(scope):
         if action in ("/start", "/help"):
-            await message.answer("✶")
+            await message.answer(COMMAND_HELP)
             return
         if action == "/forget":
             await asyncio.to_thread(memory.forget, scope)
