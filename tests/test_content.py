@@ -364,7 +364,7 @@ class WorkerDeadlineTests(unittest.TestCase):
 
 
 class HandlerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_instructions_and_processing_commands_are_removed_but_forget_still_works(self):
+    async def test_start_lists_supported_commands_while_legacy_controls_stay_inactive(self):
         message = SimpleNamespace(chat=SimpleNamespace(id=1), from_user=SimpleNamespace(id=2),
                                   photo=[], video=None, audio=None, voice=None, video_note=None,
                                   animation=None, document=None, answer=AsyncMock())
@@ -376,7 +376,11 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                 for command in ("/start", "/help@glitch_bot"):
                     message.text = command
                     await engine.handle_file(message)
-                self.assertEqual([call.args[0] for call in message.answer.await_args_list], ["✶", "✶"])
+                replies = [call.args[0] for call in message.answer.await_args_list]
+                self.assertEqual(replies[0], replies[1])
+                self.assertEqual([line.split(" — ")[0] for line in replies[0].splitlines()],
+                                 ["/start", "/help", "/dreams on", "/dreams off",
+                                  "/translate on", "/translate off", "/forget"])
                 message.answer.reset_mock()
                 for text in ("hello", "/mode raw", "/mode fuse", "/chaos 12", "/chaos auto", "/status"):
                     message.text = text
