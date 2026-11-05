@@ -225,17 +225,27 @@ forks must deliberately configure their own identity and destination.
 
 ## Random translations
 
-Set `TRANSLATE_URL` to the root URL of a LibreTranslate-compatible service, e.g.
-`https://your-translator.example`, with **no** `/translate` suffix. Set
-`TRANSLATE_API_KEY` if it requires authentication. No public service or API key is
-silently selected. You can self-host LibreTranslate; see
-<https://docs.libretranslate.com/guides/installation/>.
+Translation uses the free anonymous MyMemory API by default when no
+`TRANSLATE_URL` is set. No API key, account or paid service is needed. Its
+[anonymous quota](https://mymemory.translated.net/doc/usagelimits.php) is 5,000
+characters/day, shared by traffic using the same public IP. The bot sends only
+selected short snippets to `https://api.mymemory.translated.net/get`, with automatic
+source-language detection and random targets. Requests are capped at 500 UTF-8
+bytes; provider errors are never inserted into the file. A reported exhausted
+quota pauses further requests for an hour in this process; glitches continue.
+
+An existing `TRANSLATE_URL` keeps selecting LibreTranslate for compatibility.
+To use your own server, set `TRANSLATE_PROVIDER=libretranslate` and
+`TRANSLATE_URL` to its root URL, with **no** `/translate` suffix. Set
+`TRANSLATE_API_KEY` if it requires authentication. To explicitly choose the free
+provider even with a legacy URL present, set `TRANSLATE_PROVIDER=mymemory`.
+See <https://docs.libretranslate.com/guides/installation/> for self-hosting.
 
 The optional `/translate on` command opts that sender/chat into sending
 selected snippets to the configured provider; images are OCR'd locally and only
 recognized text is sent, never the image itself. `/translate off` stops this.
 Translation is off by default; automatic processing does not enable it or change
-an existing opt-in. Without a service, memory effects still work. These controls
+an existing opt-in. When the provider is unavailable, memory effects still work. These controls
 are listed by `/start` and `/help`. Group members cannot enable translation for
 each other's uploads.
 
@@ -249,8 +259,16 @@ these plain-text formats. DOCX/PDF content fusion and word permutations are loca
 and do not send extracted document text to the translation provider.
 
 `TRANSLATE_TARGETS` defaults to `en,ru,de,fr,es,it,pt,el,uk,pl,tr`; set it to
-languages supported by your provider. `OCR_LANGUAGES` defaults to `eng+rus`;
-only installed Tesseract packs are used. OCR can miss handwriting, stylized,
+languages supported by your provider. `OCR_LANGUAGES` defaults to `eng+rus`.
+An installed Tesseract executable uses its installed language packs. On native
+Python hosts without that executable, the `tesserocr` wheel provides a local
+engine. Its first use downloads approximately 8 MB of official English/Russian
+models from `tesseract-ocr/tessdata_fast`, pinned to a revision and checked against
+SHA-256 hashes. Models are cached under `data/tessdata` (`OCR_DATA_DIR` overrides
+this); no images are sent to download them. Recognition runs in a separate
+process with an eight-second timeout and no bot/database credentials. This
+fallback supports English and Russian without changing the free Render runtime.
+OCR can miss handwriting, stylized,
 small or rotated text. A flat local background approximates erased text, rather
 than reconstructing the original scene. Unsupported fonts/languages can require
 installing a suitable font and setting `GLITCH_FONT` to its path. The Docker image
@@ -260,16 +278,16 @@ recorded in server logs and do not stop ordinary glitches.
 ## Run and deploy
 
 For local Python on Linux: `pip install -r requirements.txt`, install FFmpeg,
-Poppler utilities, Tesseract plus the English/Russian language packs and a
-suitable font, then set `BOT_TOKEN` and run
+Poppler utilities and a suitable font. Tesseract plus language packs is optional
+for image translation when a bundled `tesserocr` wheel is available. Set `BOT_TOKEN` and run
 `python glitch_bot.py`. Polling mode removes an existing webhook for this token:
 use a separate test bot when trying the branch locally.
 
 The Dockerfile includes OCR, fonts, FFmpeg and Poppler. Build with
 `docker build -t glitch-bot .`, then run with
 `docker run --env-file .env -v glitch-memory:/app/data glitch-bot`.
-Keep `.env` out of git. Add `BOT_TOKEN`, `TRANSLATE_URL`, and any optional
-`TRANSLATE_API_KEY` there. Cloud-API uploads are limited to 20 MB, text files to 512 KB,
+Keep `.env` out of git. Add `BOT_TOKEN` there. Translation needs no extra
+configuration for MyMemory; LibreTranslate uses the optional variables above. Cloud-API uploads are limited to 20 MB, text files to 512 KB,
 images to 12 megapixels and processing resolution to 1600 px on the longest edge.
 Heavy processing runs off the event loop; at most two uploads run concurrently,
 with ordered processing within each sender/chat history. Only one document/media
@@ -322,8 +340,9 @@ code. The default remains Telegram's public API.
 Deploy the changes to the existing **Docker** web service so the new FFmpeg and
 Poppler packages are installed. Changing `render.yaml` alone may not convert an
 existing native-Python service. Use a Docker service (or update the runtime if
-Render offers that option), preserve `BOT_TOKEN`, and set `TRANSLATE_URL` and
-optional `TRANSLATE_API_KEY` in its environment. Retain the `/health` endpoint and
+Render offers that option), preserve `BOT_TOKEN`. MyMemory needs no extra
+environment variables; a LibreTranslate server uses `TRANSLATE_URL` and optional
+`TRANSLATE_API_KEY`. Retain the `/health` endpoint and
 automatic `RENDER_EXTERNAL_URL`. Stop the old service before activating another
 service with the same token, so they do not compete over the Telegram webhook.
 No hosted service has been reconfigured by this code change.

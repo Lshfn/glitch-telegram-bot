@@ -5,6 +5,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY glitch_bot.py artifact_memory.py language_glitch.py memory_effects.py content_fusion.py file_formats.py format_worker.py image_agents.py image_surfaces.py video_mosh.py bot_settings.py memory_dreams.py dream_auth.py ./
+COPY glitch_bot.py artifact_memory.py language_glitch.py local_ocr.py memory_effects.py content_fusion.py file_formats.py format_worker.py image_agents.py image_surfaces.py video_mosh.py bot_settings.py memory_dreams.py dream_auth.py ./
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "glitch_bot.py"]
