@@ -3,6 +3,7 @@ import random
 import asyncio
 import math
 import logging
+import shutil
 import weakref
 from contextlib import suppress
 from io import BytesIO
@@ -62,7 +63,8 @@ dp = Dispatcher()
 # Sender-local history; remote storage can survive free-host restarts.
 memory = configured_memory()
 translator = Translator(os.getenv("TRANSLATE_URL", ""), os.getenv("TRANSLATE_API_KEY", ""),
-                        [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()])
+                        [s.strip() for s in os.getenv("TRANSLATE_TARGETS", "en,ru,de,fr,es,it,pt,el,uk,pl,tr").split(",") if s.strip()],
+                        provider=os.getenv("TRANSLATE_PROVIDER", "libretranslate" if os.getenv("TRANSLATE_URL") else "mymemory"))
 processing_slots = asyncio.Semaphore(2)
 content_slots = asyncio.Semaphore(1)
 dream_dispatch_lock = asyncio.Lock()
@@ -872,6 +874,8 @@ async def on_render_startup(bot: Bot):
     )
     print(f"GLITCH BOT WEBHOOK ACTIVE: {webhook_url}")
     logger.info("Memory storage backend=%s", "remote" if memory.remote_url else "local")
+    logger.info("Translation provider=%s configured=%s OCR=%s", translator.provider,
+                translator.configured, "system" if shutil.which("tesseract") else "portable")
 
 
 async def run_local_polling():

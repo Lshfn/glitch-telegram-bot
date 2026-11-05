@@ -1,9 +1,11 @@
 """Real translations, optional local OCR, and replacement inside text regions."""
 import asyncio
+import html
 import os
 import random
 import re
 import shutil
+import time
 from dataclasses import dataclass
 
 import aiohttp
@@ -41,15 +43,17 @@ class TextRegion:
 
 def read_regions(image):
     if not shutil.which("tesseract"):
-        raise RuntimeError("OCR needs the Tesseract executable (use the Docker deployment)")
-    import pytesseract
-    available = set(pytesseract.get_languages())
-    requested = os.getenv("OCR_LANGUAGES", "eng+rus").split("+")
-    languages = "+".join(lang for lang in requested if lang in available)
-    if not languages:
-        raise RuntimeError("Requested OCR language packs are not installed")
-    data = pytesseract.image_to_data(image, lang=languages, config="--psm 11",
-                                    output_type=pytesseract.Output.DICT, timeout=8)
+        from local_ocr import read_data
+        data = read_data(image)
+    else:
+        import pytesseract
+        available = set(pytesseract.get_languages())
+        requested = os.getenv("OCR_LANGUAGES", "eng+rus").split("+")
+        languages = "+".join(lang for lang in requested if lang in available)
+        if not languages:
+            raise RuntimeError("Requested OCR language packs are not installed")
+        data = pytesseract.image_to_data(image, lang=languages, config="--psm 11",
+                                        output_type=pytesseract.Output.DICT, timeout=8)
     lines = {}
     for i, text in enumerate(data["text"]):
         text = text.strip()
@@ -96,33 +100,67 @@ def paint_translation(image, region, translated):
 
 
 class Translator:
-    def __init__(self, url="", api_key="", targets=None):
+    def __init__(self, url="", api_key="", targets=None, provider="libretranslate"):
+        if provider not in ("libretranslate", "mymemory"):
+            raise ValueError("Unsupported TRANSLATE_PROVIDER")
+        self.provider = provider
         self.url = url.rstrip("/")
         self.api_key = api_key
         self.targets = targets or ["en", "ru", "de", "fr", "es", "it", "pt", "el", "uk", "pl", "tr"]
+        self.retry_at = 0
 
     @property
     def configured(self):
-        return bool(self.url)
+        return self.provider == "mymemory" or bool(self.url)
 
-    async def translate(self, session, text):
-        choices = list(dict.fromkeys(self.targets))
-        random.shuffle(choices)
-        for target in choices[:2]:
-            payload = {"q": text[:240], "source": "auto", "target": target, "format": "text"}
+    async def request(self, session, text, target):
+        timeout = aiohttp.ClientTimeout(total=12 if self.provider == "mymemory" else 5)
+        if self.provider == "mymemory":
+            if time.monotonic() < self.retry_at:
+                raise ValueError("Translation quota temporarily unavailable")
+            # MyMemory accepts at most 500 UTF-8 bytes, rather than characters.
+            query = text.encode("utf-8")[:500].decode("utf-8", errors="ignore")
+            async with session.get("https://api.mymemory.translated.net/get",
+                                   params={"q": query, "langpair": f"autodetect|{target}"},
+                                   timeout=timeout, allow_redirects=False) as response:
+                response.raise_for_status()
+                result = await response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Translation service returned an invalid response")
+            if result.get("quotaFinished"):
+                self.retry_at = time.monotonic() + 3600
+                raise ValueError("Translation quota reached")
+            if str(result.get("responseStatus")) != "200":
+                raise ValueError("Translation service could not translate this phrase")
+            data = result.get("responseData")
+            if not isinstance(data, dict):
+                raise ValueError("Translation service returned an invalid response")
+            value = data.get("translatedText")
+            source = data.get("detectedLanguage")
+            if isinstance(value, str):
+                value = html.unescape(value)
+        else:
+            payload = {"q": text, "source": "auto", "target": target, "format": "text"}
             if self.api_key:
                 payload["api_key"] = self.api_key
             async with session.post(self.url + "/translate", json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=5), allow_redirects=False) as response:
+                                    timeout=timeout, allow_redirects=False) as response:
                 response.raise_for_status()
                 result = await response.json()
             if not isinstance(result, dict):
                 raise ValueError("Translation service returned an invalid response")
             value = result.get("translatedText")
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError("Translation service returned no text")
             detected = result.get("detectedLanguage")
             source = detected.get("language") if isinstance(detected, dict) else None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Translation service returned no text")
+        return value, source
+
+    async def translate(self, session, text):
+        choices = list(dict.fromkeys(self.targets))
+        random.shuffle(choices)
+        for target in choices[:2]:
+            value, source = await self.request(session, text[:240], target)
             if value.strip() != text.strip() and source != target:
                 return value[:600], target
         return text, None
@@ -134,9 +172,15 @@ class Translator:
         selected = sorted(random.sample(spans, min(len(spans), random.randint(2, 5))),
                           key=lambda m: m.start(), reverse=True)
         targets, failures = [], 0
-        for match in selected:
+        deadline = time.monotonic() + 22
+        for index, match in enumerate(selected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failures += len(selected) - index
+                break
             try:
-                value, target = await self.translate(session, match.group())
+                async with asyncio.timeout(remaining):
+                    value, target = await self.translate(session, match.group())
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
                 failures += 1
                 continue
@@ -148,9 +192,15 @@ class Translator:
     async def replace_regions(self, image, regions, session):
         targets, failures = [], 0
         selected = random.sample(regions, min(len(regions), random.randint(2, 5)))
-        for region in selected:
+        deadline = time.monotonic() + 22
+        for index, region in enumerate(selected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failures += len(selected) - index
+                break
             try:
-                value, target = await self.translate(session, region.text)
+                async with asyncio.timeout(remaining):
+                    value, target = await self.translate(session, region.text)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
                 failures += 1
                 continue
